@@ -25,7 +25,7 @@ let package = Package(
         ),
         .binaryTarget(
             name: "libdkls-rs",
-            path: "../target/libdkls-rs.xcframework"
+            path: "libdkls-rs.xcframework"
         ),
     ]
 )

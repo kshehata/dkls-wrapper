@@ -4,6 +4,7 @@ set -e
 
 # TODO: pass these in from build env
 PACKAGE=dkls
+SWIFT_PACKAGE=DKLSLib
 
 SIM_TARGETS=(
     aarch64-apple-ios-sim
@@ -19,6 +20,8 @@ IOS_TARGET="aarch64-apple-ios"
 
 ALL_TARGETS=("${SIM_TARGETS[@]}" "${MAC_TARGETS[@]}" "${IOS_TARGET}")
 ALL_UNI_TARGETS=("${SIM_UNI_TARGET}" "${MAC_UNI_TARGET}" "${IOS_TARGET}")
+
+cd rust
 
 # Make sure we have rust for all the targets
 for t in ${ALL_TARGETS[@]}; do
@@ -69,9 +72,14 @@ cargo run --bin uniffi-bindgen-swift -- \
     --modulemap-filename module.modulemap
 
 # Move the swift files to the right place
-mv target/xcframework_headers/*.swift swift/Sources/DKLSLib/
+mv target/xcframework_headers/*.swift ../swift/Sources/$SWIFT_PACKAGE/
 
 echo "Generating XCFramework"
-FRAMEWORK_PATH=target/lib$PACKAGE-rs.xcframework
+FRAMEWORK_PATH=../swift/lib$PACKAGE-rs.xcframework
 rm -rf $FRAMEWORK_PATH
 xcodebuild -create-xcframework $LIBS -output $FRAMEWORK_PATH
+
+cd ../swift
+swift build
+swift test
+cd ..
