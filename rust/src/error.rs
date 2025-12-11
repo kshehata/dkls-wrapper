@@ -2,7 +2,6 @@ use uniffi::Error;
 use sl_dkls23::keygen::types::KeygenError as DklsKeygenError;
 
 #[derive(Debug, Error, thiserror::Error)]
-
 pub enum KeygenError {
     /// Error while serializing or deserializing message data, or invalid message length
     #[error(
@@ -90,5 +89,24 @@ impl From<DklsKeygenError> for KeygenError {
             DklsKeygenError::SendMessage => Self::SendMessage,
             DklsKeygenError::AbortProtocol(p) => Self::AbortProtocol(p as u32),
         }
+    }
+}
+
+
+#[derive(Debug, Error, thiserror::Error)]
+pub enum NetworkError {
+    #[error("Message sending error")]
+    MessageSendError,
+}
+
+impl From<sl_dkls23::MessageSendError> for NetworkError {
+    fn from(_: sl_dkls23::MessageSendError) -> Self {
+        Self::MessageSendError
+    }
+}
+
+impl Into<sl_dkls23::MessageSendError> for NetworkError {
+    fn into(self) -> sl_dkls23::MessageSendError {
+        sl_dkls23::MessageSendError
     }
 }
