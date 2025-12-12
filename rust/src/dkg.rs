@@ -65,10 +65,14 @@ impl DKGNode {
     pub fn party_vk(&self) -> Vec<Arc<NodeVerifyingKey>> {
         self.party_vk.lock().unwrap().clone()
     }
+
+    pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, KeygenError> {
+        self.do_keygen_relay(create_network_relay(interface)).await
+    }
 }
 
 impl DKGNode {
-    pub async fn do_keygen<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
+    pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
         let ranks = vec![0u8; self.party_vk.lock().unwrap().len()];
         let no_vk_vec: Vec<NoVerifyingKey> = self.party_vk.lock().unwrap()
             .iter()
@@ -129,7 +133,7 @@ impl DKGRunner {
         // Use block_on to execute the async operation *on* the DKGRunner's runtime
         let result = rt.block_on(async {
             // The async block *itself* now runs under the context of 'rt'
-            node.do_keygen(self.coord.connect()).await
+            node.do_keygen_relay(self.coord.connect()).await
         });
         
         result
@@ -163,7 +167,7 @@ mod tests {
         for node in nodes {
             let relay = coord.connect();
             parties.spawn(async move {
-                node.do_keygen(relay).await
+                node.do_keygen_relay(relay).await
             });
         }
 
