@@ -131,3 +131,45 @@ final class MockNetworkInterface: NetworkInterface {
     let tester = NetworkInterfaceTester(interface: network_interface)
     await #expect(throws: NetworkError.MessageSendError.self) { try await tester.test() }
 }
+
+@Test func network_relay_test() async throws {
+    let mirror = NetworkMirror()
+    let tester = NetworkInterfaceTester(interface: mirror)
+    try await tester.testRelay(data: Data([1, 2, 3, 4]))
+}
+
+@Test func network_relay_send_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        send_result: .failure(NetworkError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: NetworkError.MessageSendError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_fail() async throws {
+    let network_interface = MockNetworkInterface(
+        receive_result: .failure(NetworkError.MessageSendError))
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: NetworkError.MessageSendError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_wrong_data() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data()), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: NetworkError.MessageSendError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func network_relay_receive_wrong_data2() async throws {
+    let network_interface = MockNetworkInterface(
+        send_delay: 100, receive_result: .success(Data([1, 2, 3, 5])), received_delay: 100)
+    let tester = NetworkInterfaceTester(interface: network_interface)
+    await #expect(throws: NetworkError.MessageSendError.self) {
+        try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}

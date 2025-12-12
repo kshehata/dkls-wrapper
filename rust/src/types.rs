@@ -1,6 +1,5 @@
 use std::sync::Arc;
-use futures::Future;
-use futures::{sink, Sink, Stream};
+use futures::{Future, sink, Sink, SinkExt, Stream, StreamExt};
 use core::pin::Pin;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -90,6 +89,8 @@ pub trait NetworkInterface: Send + Sync {
     async fn receive(&self) -> Result<Vec<u8>, NetworkError>;
 }
 
+// Helper class to test the network interface.
+// Basically just sends a message and checks if it comes back.
 #[derive(uniffi::Object)]
 pub struct NetworkInterfaceTester {
     interface: Arc<dyn NetworkInterface>,
@@ -110,6 +111,20 @@ impl NetworkInterfaceTester {
         tx_res?;
         let received = rx_res?;
         if test_bytes != received {
+            return Err(NetworkError::MessageSendError);
+        }
+        Ok(())
+    }
+
+    pub async fn test_relay(&self, data: Vec<u8>) -> Result<(), NetworkError> {
+        let mut r1 = create_network_relay(self.interface.clone());
+        let mut r2 = create_network_relay(self.interface.clone());
+        let tx = r1.send(data.clone());
+        let rx = r2.next();
+        let (tx_res, rx_res) = futures::join!(tx, rx);
+        tx_res?;
+        let received = rx_res.ok_or(NetworkError::MessageSendError)?;
+        if data != received {
             return Err(NetworkError::MessageSendError);
         }
         Ok(())
