@@ -66,10 +66,7 @@ struct MessagingCLI {
 
             print(colorize("✓ Connected to message stream", .green))
             print()
-            print(colorize("Type your message and press Enter to send.", .cyan))
-            print(colorize("Press Ctrl+C to exit.", .cyan))
-            print(colorize("-" * 50, .cyan))
-            print()
+            // try await Task.sleep(nanoseconds: 1_000_000_000)  // Sleep for 100ms to get any old messages
 
             // Set up signal handler for graceful shutdown
             signal(SIGINT) { _ in
@@ -79,11 +76,20 @@ struct MessagingCLI {
                 exit(0)
             }
 
-            // Read input from stdin and send messages
-            while let line = readLine() {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let input_task = Task.detached {
+                print(colorize("Type your message and press Enter to send.", .cyan))
+                print(colorize("Use /q or press Ctrl+C to exit.", .cyan))
+                print(colorize("-" * 50, .cyan))
+                print()
 
-                if !trimmed.isEmpty {
+                while let line = readLine() {
+                    if line.lowercased().starts(with: "/q") {
+                        break
+                    }
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty {
+                        continue
+                    }
                     do {
                         try await MessagingService.shared.sendMessage(sender: userId, text: trimmed)
                     } catch {
@@ -92,7 +98,10 @@ struct MessagingCLI {
                         )
                     }
                 }
+                print("Input listener stopped.")
             }
+
+            await input_task.value
 
         } catch {
             print(colorize("❌ Error: \(error)", .red))
