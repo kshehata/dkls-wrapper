@@ -14,26 +14,37 @@ use crate::error::NetworkError;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, uniffi::Object)]
-pub struct InstanceId(sl_dkls23::InstanceId);
+// We need to make our own InstanceID so we have access to the data under it.
+pub struct InstanceId([u8; 32]);
+
+impl InstanceId {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<[u8; 32]> for InstanceId {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::new(bytes)
+    }
+}
 
 #[uniffi::export]
 impl InstanceId {
     #[uniffi::constructor]
     pub fn from_entropy() -> Arc<Self> {
         let mut rnd = ChaCha20Rng::from_entropy();
-        Arc::new(Self(sl_dkls23::InstanceId::new(rnd.gen())))
+        Arc::new(Self(rnd.gen()))
     }
-}
 
-impl From<sl_dkls23::InstanceId> for InstanceId {
-    fn from(value: sl_dkls23::InstanceId) -> Self {
-        Self(value)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_vec()
     }
 }
 
 impl Into<sl_dkls23::InstanceId> for InstanceId {
     fn into(self) -> sl_dkls23::InstanceId {
-        self.0
+        sl_dkls23::InstanceId::new(self.0)
     }
 }
 

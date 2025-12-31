@@ -1,3 +1,4 @@
+import DKLSLib
 import Foundation
 
 // ANSI color codes for terminal output
@@ -26,6 +27,14 @@ struct MessagingCLI {
         print()
 
         do {
+            // Parse arguments
+            let args = ProcessInfo.processInfo.arguments
+            let instanceID =
+                (args.count > 1 ? Data(base64Encoded: args[1]) : nil)
+                ?? InstanceId.fromEntropy().toBytes()
+
+            print(colorize("🆔 Using Instance ID: \(instanceID.base64EncodedString())", .cyan))
+
             // Configure Firebase
             print(colorize("📱 Configuring Firebase...", .yellow))
             try FirebaseConfig.shared.configure()
@@ -43,7 +52,8 @@ struct MessagingCLI {
 
             // Start listening to messages
             print(colorize("👂 Listening for messages...", .yellow))
-            MessagingService.shared.listenToMessages { messages in
+            let service = MessagingService.getInstance(instanceID: instanceID, sender: userId)
+            service.listenToMessages { messages in
                 for message in messages {
                     let messageId =
                         "\(message.sender):\(message.timestamp.timeIntervalSince1970):\(message.text)"
@@ -66,15 +76,19 @@ struct MessagingCLI {
 
             print(colorize("✓ Connected to message stream", .green))
             print()
-            // try await Task.sleep(nanoseconds: 1_000_000_000)  // Sleep for 100ms to get any old messages
+
+            // Ignore the default action for SIGINT to allow our DispatchSource to handle it
+            signal(SIGINT, SIG_IGN)
 
             // Set up signal handler for graceful shutdown
-            signal(SIGINT) { _ in
+            let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+            signalSource.setEventHandler {
                 print()
                 print(colorize("\n👋 Shutting down...", .yellow))
-                MessagingService.shared.stopListening()
+                service.stopListening()
                 exit(0)
             }
+            signalSource.resume()
 
             let input_task = Task.detached {
                 print(colorize("Type your message and press Enter to send.", .cyan))
@@ -91,7 +105,7 @@ struct MessagingCLI {
                         continue
                     }
                     do {
-                        try await MessagingService.shared.sendMessage(sender: userId, text: trimmed)
+                        try service.sendMessage(text: trimmed)
                     } catch {
                         print(
                             colorize("❌ Error sending message: \(error.localizedDescription)", .red)
