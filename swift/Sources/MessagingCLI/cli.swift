@@ -19,98 +19,68 @@ func colorize(_ text: String, _ color: Color) -> String {
 @main
 struct MessagingCLI {
     static func main() async {
-        print(colorize("🔥 Firebase Messaging CLI", .cyan))
+        print(colorize("DKLS CLI DKG Test", .cyan))
         print(colorize("=" * 50, .cyan))
         print()
 
         do {
             // Parse arguments
             let args = ProcessInfo.processInfo.arguments
-            let instanceID =
-                (args.count > 1 ? Data(base64Encoded: args[1]) : nil)
-                ?? InstanceId.fromEntropy().toBytes()
+            guard args.count >= 5 else {
+                print(
+                    colorize(
+                        "Usage: \(args[0]) <instanceID|-> <numParties> <threshold> <partyIndex>",
+                        .red))
+                return
+            }
 
-            print(colorize("🆔 Using Instance ID: \(instanceID.base64EncodedString())", .cyan))
+            let numParties = UInt8(args[2])!
+            let threshold = UInt8(args[3])!
+            let partyIndex = UInt8(args[4])!
+
+            let instanceID: InstanceId
+            if args[1] == "-" {
+                instanceID = InstanceId.fromEntropy()
+            } else {
+                guard let data = Data(base64Encoded: args[1]) else {
+                    print(colorize("Error: Invalid base64 for Instance ID", .red))
+                    exit(1)
+                }
+                do {
+                    instanceID = try InstanceId.fromBytes(bytes: data)
+                } catch {
+                    print(colorize("Error: Invalid Instance ID bytes", .red))
+                    exit(1)
+                }
+            }
+
+            print(colorize("🆔 Using Instance ID: \(instanceID.toBytes().base64EncodedString())", .cyan))
+            print(
+                colorize("Settings: n = \(numParties), t = \(threshold), i = \(partyIndex)", .cyan))
+
+            print(colorize("Setting up DKG node...", .yellow))
+            let dkgNode = DkgNode.forId(
+                instance: instanceID, threshold: threshold, numParties: numParties,
+                partyId: partyIndex)
+            print(colorize("✓ DKG node set up", .green))
 
             // Configure Firebase
             print(colorize("📱 Configuring Firebase...", .yellow))
             try FirebaseConfig.shared.configure()
             print(colorize("✓ Firebase configured", .green))
 
-            // Sign in anonymously
-            print(colorize("Skipping sign in...", .yellow))
-            print("What is your name? ", terminator: "")
-            let userId = readLine() ?? "Bob"
-            // print(colorize("🔐 Signing in anonymously...", .yellow))
-            // let user = try await FirebaseConfig.shared.signInAnonymously()
-            // let userId = user.uid
-            // print(colorize("✓ Signed in as: \(userId)", .green))
-            print()
-
             // Start listening to messages
             print(colorize("👂 Listening for messages...", .yellow))
-            let service = MessagingService.getInstance(instanceID: instanceID, sender: userId)
-
-            Task {
-                do {
-                    while true {
-                        let data = try await service.receive()
-                        if let text = String(data: data, encoding: .utf8) {
-                            print()
-                            print(colorize("Received Message:", .magenta))
-                            print("  \(text)")
-                        } else {
-                            print()
-                            print(colorize("Received \(data.count) bytes", .magenta))
-                        }
-                    }
-                } catch {
-                    print(colorize("Error receiving messages: \(error)", .red))
-                }
-            }
-
+            let service = MessagingService.getInstance(
+                instanceID: instanceID.toBytes(), sender: String(partyIndex))
             print(colorize("✓ Connected to message stream", .green))
             print()
 
-            // Ignore the default action for SIGINT to allow our DispatchSource to handle it
-            signal(SIGINT, SIG_IGN)
-
-            // Set up signal handler for graceful shutdown
-            let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-            signalSource.setEventHandler {
-                print()
-                print(colorize("\n👋 Shutting down...", .yellow))
-                service.stopListening()
-                exit(0)
-            }
-            signalSource.resume()
-
-            let input_task = Task.detached {
-                print(colorize("Type your message and press Enter to send.", .cyan))
-                print(colorize("Use /q or press Ctrl+C to exit.", .cyan))
-                print(colorize("-" * 50, .cyan))
-                print()
-
-                while let line = readLine() {
-                    if line.lowercased().starts(with: "/q") {
-                        break
-                    }
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty {
-                        continue
-                    }
-                    do {
-                        try await service.send(data: trimmed.data(using: .utf8) ?? Data())
-                    } catch {
-                        print(
-                            colorize("❌ Error sending message: \(error.localizedDescription)", .red)
-                        )
-                    }
-                }
-                print("Input listener stopped.")
-            }
-
-            await input_task.value
+            print(colorize("Generating key shares...", .yellow))
+            let share = try await dkgNode.doKeygen(interface: service)
+            print(colorize("✓ Key shares generated", .green))
+            print()
+            share.print()
 
         } catch {
             print(colorize("❌ Error: \(error)", .red))

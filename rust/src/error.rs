@@ -2,6 +2,15 @@ use uniffi::Error;
 use sl_dkls23::keygen::types::KeygenError as DklsKeygenError;
 
 #[derive(Debug, Error, thiserror::Error)]
+#[uniffi(flat_error)]
+pub enum GeneralError {
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    #[error("Internal failure")]
+    Generic,
+}
+
+#[derive(Debug, Error, thiserror::Error)]
 pub enum KeygenError {
     /// Error while serializing or deserializing message data, or invalid message length
     #[error(

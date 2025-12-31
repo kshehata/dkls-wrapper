@@ -54,6 +54,23 @@ impl DKGNode {
         })
     }
 
+    #[uniffi::constructor]
+    pub fn for_id(instance: Arc<InstanceId>, threshold: u8, num_parties: u8, party_id: u8) -> Arc<Self> {
+        assert!(party_id < num_parties, "party_id must be less than num_parties");
+        assert!(threshold <= num_parties, "threshold must be less than or equal to num_parties");
+
+        let party_vk = (0..num_parties)
+            .map(|id| Arc::new(NodeVerifyingKey::from(id as usize)))
+            .collect();
+        return Arc::new(Self {
+            instance: *instance,
+            threshold,
+            secret_key: NodeSecretKey {},
+            party_id,
+            party_vk: Mutex::new(party_vk),
+        });
+    }
+
     pub fn add_party(&self, party_vk: Arc<NodeVerifyingKey>) {
         self.party_vk.lock().unwrap().push(party_vk);
     }

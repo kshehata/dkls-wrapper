@@ -64,6 +64,10 @@ class MessagingService: NetworkInterface {
                             if diff.type == .added {
                                 do {
                                     let message = try diff.document.data(as: Message.self)
+                                    // ignore messages from self
+                                    if message.sender == self.sender {
+                                        return
+                                    }
                                     // Handle URL-safe Base64
                                     var base64 = message.text
                                         .replacingOccurrences(of: "-", with: "+")

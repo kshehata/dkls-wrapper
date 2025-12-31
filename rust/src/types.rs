@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use k256::elliptic_curve::group::GroupEncoding;
 
-use crate::error::NetworkError;
+use crate::error::{GeneralError, NetworkError};
 
 
 /*****************************************************************************
@@ -35,6 +35,12 @@ impl InstanceId {
     pub fn from_entropy() -> Arc<Self> {
         let mut rnd = ChaCha20Rng::from_entropy();
         Arc::new(Self(rnd.gen()))
+    }
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
+        bytes.try_into()
+            .map(Self)
+            .map_err(|_| GeneralError::InvalidInput("Must be exactly 32 bytes".to_string()))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
