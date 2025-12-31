@@ -16,9 +16,6 @@ func colorize(_ text: String, _ color: Color) -> String {
     return "\(color.rawValue)\(text)\(Color.reset.rawValue)"
 }
 
-// Track displayed messages to avoid duplicates
-var displayedMessages = Set<String>()
-
 @main
 struct MessagingCLI {
     static func main() async {
@@ -53,24 +50,22 @@ struct MessagingCLI {
             // Start listening to messages
             print(colorize("👂 Listening for messages...", .yellow))
             let service = MessagingService.getInstance(instanceID: instanceID, sender: userId)
-            service.listenToMessages { messages in
-                for message in messages {
-                    let messageId =
-                        "\(message.sender):\(message.timestamp.timeIntervalSince1970):\(message.text)"
 
-                    // Only display new messages
-                    if !displayedMessages.contains(messageId) {
-                        displayedMessages.insert(messageId)
-
-                        let timestamp = formatTimestamp(message.timestamp)
-                        let senderColor: Color = message.sender == userId ? .blue : .magenta
-                        let senderLabel =
-                            message.sender == userId ? "You" : "User \(message.sender.prefix(8))"
-
-                        print()
-                        print(colorize("[\(timestamp)] \(senderLabel):", senderColor))
-                        print("  \(message.text)")
+            Task {
+                do {
+                    while true {
+                        let data = try await service.receive()
+                        if let text = String(data: data, encoding: .utf8) {
+                            print()
+                            print(colorize("Received Message:", .magenta))
+                            print("  \(text)")
+                        } else {
+                            print()
+                            print(colorize("Received \(data.count) bytes", .magenta))
+                        }
                     }
+                } catch {
+                    print(colorize("Error receiving messages: \(error)", .red))
                 }
             }
 
@@ -105,7 +100,7 @@ struct MessagingCLI {
                         continue
                     }
                     do {
-                        try service.sendMessage(text: trimmed)
+                        try await service.send(data: trimmed.data(using: .utf8) ?? Data())
                     } catch {
                         print(
                             colorize("❌ Error sending message: \(error.localizedDescription)", .red)

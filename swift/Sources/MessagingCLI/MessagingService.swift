@@ -1,3 +1,4 @@
+import DKLSLib
 import FirebaseFirestore
 import Foundation
 
@@ -17,12 +18,13 @@ struct Message: Codable {
 }
 
 /// Service for sending and receiving messages via Firebase Firestore
-class MessagingService {
+class MessagingService: NetworkInterface {
     private let db: Firestore
     private let instanceID: Data
     private let sender: String
     private let messagesCollection = "messages"
     private var listener: ListenerRegistration?
+    private var messageIterator: AsyncThrowingStream<Data, Error>.Iterator?
 
     public static func getInstance(instanceID: Data, sender: String) -> MessagingService {
         return MessagingService(instanceID: instanceID, sender: sender)
@@ -42,8 +44,57 @@ class MessagingService {
         try db.collection(messagesCollection).addDocument(from: message)
     }
 
-    func sendData(data: Data) throws {
+    func send(data: Data) async throws {
         try sendMessage(text: data.base64URLEncodedString())
+    }
+
+    func receive() async throws -> Data {
+        if messageIterator == nil {
+            let stream = AsyncThrowingStream<Data, Error> { continuation in
+                let listener = db.collection(messagesCollection)
+                    .whereField("instanceID", isEqualTo: instanceID)
+                    .order(by: "timestamp", descending: false)
+                    .addSnapshotListener { querySnapshot, error in
+                        if let error = error {
+                            continuation.finish(throwing: error)
+                            return
+                        }
+
+                        querySnapshot?.documentChanges.forEach { diff in
+                            if diff.type == .added {
+                                do {
+                                    let message = try diff.document.data(as: Message.self)
+                                    // Handle URL-safe Base64
+                                    var base64 = message.text
+                                        .replacingOccurrences(of: "-", with: "+")
+                                        .replacingOccurrences(of: "_", with: "/")
+                                    while base64.count % 4 != 0 {
+                                        base64.append("=")
+                                    }
+
+                                    if let data = Data(base64Encoded: base64) {
+                                        continuation.yield(data)
+                                    }
+                                } catch {
+                                    print("Error parsing message: \(error)")
+                                }
+                            }
+                        }
+                    }
+
+                continuation.onTermination = { @Sendable _ in
+                    listener.remove()
+                }
+            }
+            messageIterator = stream.makeAsyncIterator()
+        }
+
+        guard let data = try await messageIterator?.next() else {
+            throw NSError(
+                domain: "MessagingService", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Message stream ended"])
+        }
+        return data
     }
 
     /// Listen to messages in real-time
