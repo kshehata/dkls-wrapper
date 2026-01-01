@@ -26,6 +26,45 @@ class MQTTInterface: NetworkInterface {
     init(client: MQTTClient, topic: String) {
         self.client = client
         self.topic = topic
+        self.messageIterator = createMessageStream().makeAsyncIterator()
+    }
+
+    private func createMessageStream() -> AsyncThrowingStream<Data, Error> {
+        let topic = self.topic
+        let client = self.client
+
+        return AsyncThrowingStream { continuation in
+            // Subscribe to topic using MQTT v5 NoLocal option
+            let future = client.v5.subscribe(to: [
+                MQTTSubscribeInfoV5(topicFilter: topic, qos: .atLeastOnce, noLocal: true)
+            ])
+
+            future.whenSuccess { _ in
+                print(colorize("Subscribed to \(topic)", .green))
+            }
+
+            future.whenFailure { error in
+                continuation.finish(throwing: error)
+            }
+
+            // Add listener for messages
+            client.addPublishListener(named: "dkls_listener") { result in
+                switch result {
+                case .success(let packet):
+                    var buffer = packet.payload
+                    if let data = buffer.readData(length: buffer.readableBytes) {
+                        continuation.yield(data)
+                    }
+                case .failure(let error):
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                let _ = client.unsubscribe(from: [topic])
+                client.removePublishListener(named: "dkls_listener")
+            }
+        }
     }
 
     func send(data: Data) async throws {
@@ -37,51 +76,12 @@ class MQTTInterface: NetworkInterface {
     }
 
     func receive() async throws -> Data {
-        if messageIterator == nil {
-            let topic = self.topic
-            let client = self.client
-            let stream = AsyncThrowingStream<Data, Error> { continuation in
-                // Subscribe to topic
-                let future = client.subscribe(to: [
-                    MQTTSubscribeInfo(topicFilter: topic, qos: .atLeastOnce)
-                ])
-
-                future.whenSuccess { _ in
-                    print(colorize("Subscribed to \(topic)", .green))
-                }
-
-                future.whenFailure { error in
-                    continuation.finish(throwing: error)
-                }
-
-                // Add listener for messages
-                client.addPublishListener(named: "dkls_listener") { result in
-                    switch result {
-                    case .success(let packet):
-                        var buffer = packet.payload
-                        if let data = buffer.readData(length: buffer.readableBytes) {
-                            continuation.yield(data)
-                        }
-                    case .failure(let error):
-                        continuation.finish(throwing: error)
-                    }
-                }
-
-                continuation.onTermination = { @Sendable _ in
-                    let _ = client.unsubscribe(from: [topic])
-                    client.removePublishListener(named: "dkls_listener")
-                }
-            }
-            messageIterator = stream.makeAsyncIterator()
-        }
-
-        guard let data = try await messageIterator?.next() else {
-            throw NSError(
-                domain: "MQTTService", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Message stream ended"])
-        }
-        return data
+        return try await messageIterator?.next() ?? Data()
     }
+}
+
+func hexString(_ data: Data) -> String {
+    return data.map { String(format: "%02x", $0) }.joined()
 }
 
 @main
@@ -90,11 +90,52 @@ struct DKLSCLI {
         print(colorize("DKLS CLI DKG Test", .cyan))
         print()
 
+        // Parse arguments
+        let args = ProcessInfo.processInfo.arguments
+        guard args.count >= 5 else {
+            print(
+                colorize(
+                    "Usage: \(args[0]) <instanceID|-> <numParties> <threshold> <partyIndex>",
+                    .red))
+            return
+        }
+
+        let numParties = UInt8(args[2])!
+        let threshold = UInt8(args[3])!
+        let partyIndex = UInt8(args[4])!
+
+        let instanceID: InstanceId
+        if args[1] == "-" {
+            instanceID = InstanceId.fromEntropy()
+        } else {
+            guard let data = Data(base64Encoded: args[1]) else {
+                print(colorize("Error: Invalid base64 for Instance ID", .red))
+                exit(1)
+            }
+            do {
+                instanceID = try InstanceId.fromBytes(bytes: data)
+            } catch {
+                print(colorize("Error: Invalid Instance ID bytes", .red))
+                exit(1)
+            }
+        }
+
+        print(colorize("🆔 Using Instance ID: \(instanceID.toBytes().base64EncodedString())", .cyan))
+        print(
+            colorize("Settings: n = \(numParties), t = \(threshold), i = \(partyIndex)", .cyan))
+
+        print(colorize("Setting up DKG node...", .yellow))
+        let dkgNode = DkgNode.forId(
+            instance: instanceID, threshold: threshold, numParties: numParties,
+            partyId: partyIndex)
+        print(colorize("✓ DKG node set up", .green))
+
         let client = MQTTClient(
             host: ProcessInfo.processInfo.environment["MQTT_HOST"] ?? "localhost",
             port: Int(ProcessInfo.processInfo.environment["MQTT_PORT"] ?? "1883")!,
             identifier: "swift-\(ProcessInfo.processInfo.processIdentifier)",
-            eventLoopGroupProvider: .createNew
+            eventLoopGroupProvider: .createNew,
+            configuration: .init(version: .v5_0)
         )
 
         print(colorize("Connecting to MQTT broker...", .yellow))
@@ -107,55 +148,26 @@ struct DKLSCLI {
             exit(1)
         }
 
+        print(colorize("👂 Listening for messages...", .yellow))
         let service = MQTTInterface(
             client: client,
-            topic: "dkls-test"
+            topic: "dkg/\(hexString(instanceID.toBytes()))"
         )
+        print(colorize("✓ Connected to message stream", .green))
+        print()
 
-        Task {
-            do {
-                while true {
-                    let data = try await service.receive()
-                    if let text = String(data: data, encoding: .utf8) {
-                        print()
-                        print(colorize("Received Message:", .magenta))
-                        print("  \(text)")
-                    } else {
-                        print()
-                        print(colorize("Received \(data.count) bytes", .magenta))
-                    }
-                }
-            } catch {
-                print(colorize("Error receiving messages: \(error)", .red))
-            }
-        }
+        print(colorize("Ready. Press enter to start.", .magenta))
+        _ = readLine()
 
-        let input_task = Task.detached {
-            print(colorize("Type your message and press Enter to send.", .cyan))
-            print(colorize("Use /q or press Ctrl+C to exit.", .cyan))
-            print(colorize("--------------------------------------------------", .cyan))
+        do {
+            print(colorize("Generating key shares...", .yellow))
+            let share = try await dkgNode.doKeygen(interface: service)
+            print(colorize("✓ Key shares generated", .green))
             print()
-
-            while let line = readLine() {
-                if line.lowercased().starts(with: "/q") {
-                    break
-                }
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty {
-                    continue
-                }
-                do {
-                    try await service.send(data: trimmed.data(using: .utf8) ?? Data())
-                } catch {
-                    print(
-                        colorize("❌ Error sending message: \(error.localizedDescription)", .red)
-                    )
-                }
-            }
-            print("Input listener stopped.")
+            share.print()
+        } catch {
+            print(colorize("Error: \(error)", .red))
         }
-
-        await input_task.value
 
         print(colorize("Disconnecting...", .yellow))
         do {
