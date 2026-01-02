@@ -19,20 +19,15 @@ let package = Package(
             targets: ["DKLSLib"]
         ),
         .executable(
-            name: "MessagingCLI",
-            targets: ["MessagingCLI"]
-        ),
-        .executable(
             name: "DKLSCLI",
             targets: ["DKLSCLI"]
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/firebase/firebase-ios-sdk.git", from: "11.0.0"),
         .package(
             url: "https://github.com/swift-server-community/mqtt-nio.git",
             from: "2.12.1"
-        ),
+        )
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -40,14 +35,6 @@ let package = Package(
         .target(
             name: "DKLSLib",
             dependencies: ["libdkls-rs"]
-        ),
-        .executableTarget(
-            name: "MessagingCLI",
-            dependencies: [
-                "DKLSLib",
-                .product(name: "FirebaseAuth", package: "firebase-ios-sdk"),
-                .product(name: "FirebaseFirestore", package: "firebase-ios-sdk"),
-            ]
         ),
         .executableTarget(
             name: "DKLSCLI",
