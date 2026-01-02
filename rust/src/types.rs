@@ -6,6 +6,7 @@ use rand_chacha::ChaCha20Rng;
 use k256::elliptic_curve::group::GroupEncoding;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use signature::{Signer, Verifier};
+use serde::{Serialize, Deserialize};
 
 use crate::error::{GeneralError, NetworkError};
 
@@ -15,7 +16,7 @@ use crate::error::{GeneralError, NetworkError};
  *****************************************************************************/
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, uniffi::Object)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, uniffi::Object)]
 // We need to make our own InstanceID so we have access to the data under it.
 pub struct InstanceId([u8; 32]);
 
@@ -34,10 +35,11 @@ impl From<[u8; 32]> for InstanceId {
 #[uniffi::export]
 impl InstanceId {
     #[uniffi::constructor]
-    pub fn from_entropy() -> Arc<Self> {
+    pub fn from_entropy() -> Self {
         let mut rnd = ChaCha20Rng::from_entropy();
-        Arc::new(Self(rnd.gen()))
+        Self(rnd.gen())
     }
+
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
         bytes.try_into()
@@ -126,7 +128,7 @@ impl Signer<k256::ecdsa::Signature> for &NodeSecretKey {
     }
 }
 
-#[derive(Clone, uniffi::Object)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object)]
 pub struct NodeVerifyingKey {
     inner: VerifyingKey,
     bytes: Box<[u8]>,
@@ -161,6 +163,25 @@ impl Into<VerifyingKey> for NodeVerifyingKey {
     }
 }
 
+impl Serialize for NodeVerifyingKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.to_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeVerifyingKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        NodeVerifyingKey::from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 impl AsRef<[u8]> for NodeVerifyingKey {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
@@ -170,6 +191,76 @@ impl AsRef<[u8]> for NodeVerifyingKey {
 impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
     fn verify(&self, msg: &[u8], signature: &k256::ecdsa::Signature) -> Result<(), signature::Error> {
         self.inner.verify(msg, signature)
+    }
+}
+
+/*****************************************************************************
+ * Messages
+ *****************************************************************************/
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, uniffi::Object)]
+pub struct SignedMessage {
+    pub message: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl SignedMessage {
+    pub fn sign(msg: &Vec<u8>, sk: &NodeSecretKey) -> Result<Self, GeneralError> {
+        let signature = sk
+            .try_sign(msg)
+            .map_err(|e| GeneralError::SignatureError(e.to_string()))?;
+
+        Ok(Self {
+            message: msg.clone(),
+            signature: signature.to_bytes().to_vec(),
+        })
+    }
+}
+
+#[uniffi::export]
+impl SignedMessage {
+    pub fn verify(&self, vk: &NodeVerifyingKey) -> Result<(), GeneralError> {
+        let signature = k256::ecdsa::Signature::try_from(self.signature.as_slice())
+            .map_err(|e| GeneralError::SignatureError(e.to_string()))?;
+        vk.verify(&self.message, &signature)
+            .map_err(|e| GeneralError::SignatureError(e.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object, Serialize, Deserialize)]
+pub struct DKGSetupMessage {
+    pub instance: InstanceId,
+    pub threshold: u8,
+    pub party_id: u8,
+    pub party_vk: Vec<NodeVerifyingKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dkg_setup_message() {
+        let instance = InstanceId::from_entropy();
+        let secret_keys = vec![
+            NodeSecretKey::from_entropy(),
+            NodeSecretKey::from_entropy(),
+            NodeSecretKey::from_entropy(),
+        ];
+        let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
+        let party_id = 0usize;
+        let setup_msg = DKGSetupMessage {
+            instance,
+            threshold: 2,
+            party_id: party_id as u8,
+            party_vk,
+        };
+        let serialized = serde_json::to_string(&setup_msg).unwrap();
+        let deserialized: DKGSetupMessage = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(setup_msg, deserialized);
+
+        let signed_msg = SignedMessage::sign(&serialized.into_bytes(), &secret_keys[party_id]).unwrap();
+        assert!(signed_msg.verify(&setup_msg.party_vk[party_id]).is_ok());
     }
 }
 

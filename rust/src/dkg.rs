@@ -20,45 +20,46 @@ use crate::types::*;
 
 #[derive(uniffi::Object)]
 pub struct DKGNode {
-    pub instance: InstanceId,
-    pub threshold: u8,
+    pub setup: DKGSetupMessage,
     pub secret_key: NodeSecretKey,
-    pub party_id: u8,
-    pub party_vk: Mutex<Vec<Arc<NodeVerifyingKey>>>,
 }
 
 #[uniffi::export]
 impl DKGNode {
     #[uniffi::constructor]
-    pub fn starter(instance: Arc<InstanceId>, threshold: u8) -> Arc<Self> {
+    pub fn starter(instance: &InstanceId, threshold: u8) -> Self {
         let secret_key = NodeSecretKey::from_entropy();
-        let party_vk = vec![Arc::new(NodeVerifyingKey::from_sk(&secret_key))];
-        Arc::new(Self {
-            instance: *instance,
-            threshold,
+        let party_vk = vec![NodeVerifyingKey::from_sk(&secret_key)];
+        Self {
+            setup: DKGSetupMessage {
+                instance: *instance,
+                threshold,
+                party_id: 0,
+                party_vk: party_vk,
+            },
             secret_key,
-            party_id: 0,
-            party_vk: Mutex::new(party_vk),
-        })
+        }
     }
 
     #[uniffi::constructor]
-    pub fn new(instance: Arc<InstanceId>, threshold: u8, party_vk: &Vec<Arc<NodeVerifyingKey>>) -> Arc<Self> {
-        let my_id = party_vk.len() as u8;
+    pub fn from_setup(setup_msg: &DKGSetupMessage) -> Self {
+        let my_id = setup_msg.party_vk.len() as u8;
         let secret_key = NodeSecretKey::from_entropy();
-        let mut all_party_vk = party_vk.clone();
-        all_party_vk.push(Arc::new(NodeVerifyingKey::from_sk(&secret_key)));
-        Arc::new(Self {
-            instance: *instance,
-            threshold,
+        let mut all_party_vk = setup_msg.party_vk.clone();
+        all_party_vk.push(NodeVerifyingKey::from_sk(&secret_key));
+        Self {
+            setup: DKGSetupMessage {
+                instance: setup_msg.instance,
+                threshold: setup_msg.threshold,
+                party_id: my_id,
+                party_vk: all_party_vk,
+            },
             secret_key,
-            party_id: my_id,
-            party_vk: Mutex::new(all_party_vk),
-        })
+        }
     }
 
     #[uniffi::constructor]
-    pub fn for_id(instance: Arc<InstanceId>, threshold: u8, num_parties: u8, party_id: u8) -> Arc<Self> {
+    pub fn for_id(instance: &InstanceId, threshold: u8, num_parties: u8, party_id: u8) -> Self {
         assert!(party_id < num_parties, "party_id must be less than num_parties");
         assert!(threshold <= num_parties, "threshold must be less than or equal to num_parties");
 
@@ -77,38 +78,30 @@ impl DKGNode {
         DKGNode::starter(instance, threshold)
     }
 
-    pub fn add_party(&self, party_vk: Arc<NodeVerifyingKey>) {
-        self.party_vk.lock().unwrap().push(party_vk);
-    }
-
-    pub fn my_vk(&self) -> Arc<NodeVerifyingKey> {
-        self.party_vk.lock().unwrap()[self.party_id as usize].clone()
-    }
-
-    pub fn party_vk(&self) -> Vec<Arc<NodeVerifyingKey>> {
-        self.party_vk.lock().unwrap().clone()
-    }
-
     pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, KeygenError> {
         self.do_keygen_relay(create_network_relay(interface)).await
     }
 }
 
 impl DKGNode {
+    pub fn add_party(&mut self, party_vk: &NodeVerifyingKey) {
+        self.setup.party_vk.push(party_vk.clone());
+    }
+
+    pub fn my_vk(&self) -> &NodeVerifyingKey {
+        &self.setup.party_vk[self.setup.party_id as usize]
+    }
+
     pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
-        let ranks = vec![0u8; self.party_vk.lock().unwrap().len()];  
-        let vk_vec: Vec<NodeVerifyingKey> = self.party_vk.lock().unwrap()
-            .iter()
-            .map(|node_vk_arc| (**node_vk_arc).clone())
-            .collect();
+        let ranks = vec![0u8; self.setup.party_vk.len()];
 
         let setup_msg = SetupMessage::new(
-            self.instance.into(),
+            self.setup.instance.into(),
             &self.secret_key,
-            self.party_id.into(),
-            vk_vec,
+            self.setup.party_id.into(),
+            self.setup.party_vk.clone(),
             &ranks,
-            self.threshold.into()
+            self.setup.threshold.into()
         );
         let mut rng = ChaCha20Rng::from_entropy();
         keygen_run(setup_msg, rng.gen(), relay)
@@ -172,14 +165,13 @@ mod tests {
     async fn test_dkg_node() {
         println!("Starting test");
         let instance = InstanceId::from_entropy();
-        let mut nodes = vec![DKGNode::starter(instance.clone(), 2)];
+        let mut nodes = vec![DKGNode::starter(&instance, 2)];
         for i in 1..3 {
             println!("Adding node {}", i);
-            let party_vk = nodes[i-1].party_vk.lock().unwrap().clone();
-            nodes.push(DKGNode::new(instance.clone(), 2, &party_vk));
-            let new_vk = nodes[i].my_vk();
+            nodes.push(DKGNode::from_setup(&nodes[i-1].setup));
+            let new_vk = nodes[i].my_vk().clone();
             for j in 0..i {
-                nodes[j].add_party(new_vk.clone());
+                nodes[j].add_party(&new_vk);
             }
         }
 

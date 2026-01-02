@@ -6,6 +6,8 @@ use sl_dkls23::keygen::types::KeygenError as DklsKeygenError;
 pub enum GeneralError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+    #[error("Invalid signature: {0}")]
+    SignatureError(String),
     #[error("Internal failure")]
     Generic,
 }
