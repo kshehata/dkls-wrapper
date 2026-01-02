@@ -1,6 +1,7 @@
 
 use std::sync::{Arc, Mutex};
 use k256::elliptic_curve::group::GroupEncoding;
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -30,11 +31,12 @@ pub struct DKGNode {
 impl DKGNode {
     #[uniffi::constructor]
     pub fn starter(instance: Arc<InstanceId>, threshold: u8) -> Arc<Self> {
-        let party_vk = vec![Arc::new(NodeVerifyingKey::from(0))];
+        let secret_key = NodeSecretKey::from_entropy();
+        let party_vk = vec![Arc::new(NodeVerifyingKey::from_sk(&secret_key))];
         Arc::new(Self {
             instance: *instance,
             threshold,
-            secret_key: NodeSecretKey{},
+            secret_key,
             party_id: 0,
             party_vk: Mutex::new(party_vk),
         })
@@ -42,14 +44,15 @@ impl DKGNode {
 
     #[uniffi::constructor]
     pub fn new(instance: Arc<InstanceId>, threshold: u8, party_vk: &Vec<Arc<NodeVerifyingKey>>) -> Arc<Self> {
-        let my_id = party_vk.len();
+        let my_id = party_vk.len() as u8;
+        let secret_key = NodeSecretKey::from_entropy();
         let mut all_party_vk = party_vk.clone();
-        all_party_vk.push(Arc::new(NodeVerifyingKey::from(my_id)));
+        all_party_vk.push(Arc::new(NodeVerifyingKey::from_sk(&secret_key)));
         Arc::new(Self {
             instance: *instance,
             threshold,
-            secret_key: NodeSecretKey{},
-            party_id: my_id as u8,
+            secret_key,
+            party_id: my_id,
             party_vk: Mutex::new(all_party_vk),
         })
     }
@@ -59,6 +62,7 @@ impl DKGNode {
         assert!(party_id < num_parties, "party_id must be less than num_parties");
         assert!(threshold <= num_parties, "threshold must be less than or equal to num_parties");
 
+        /*
         let party_vk = (0..num_parties)
             .map(|id| Arc::new(NodeVerifyingKey::from(id as usize)))
             .collect();
@@ -68,7 +72,9 @@ impl DKGNode {
             secret_key: NodeSecretKey {},
             party_id,
             party_vk: Mutex::new(party_vk),
-        });
+        });*/
+        // TODO: this has to get written out.
+        DKGNode::starter(instance, threshold)
     }
 
     pub fn add_party(&self, party_vk: Arc<NodeVerifyingKey>) {
@@ -90,17 +96,17 @@ impl DKGNode {
 
 impl DKGNode {
     pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
-        let ranks = vec![0u8; self.party_vk.lock().unwrap().len()];
-        let no_vk_vec: Vec<NoVerifyingKey> = self.party_vk.lock().unwrap()
+        let ranks = vec![0u8; self.party_vk.lock().unwrap().len()];  
+        let vk_vec: Vec<NodeVerifyingKey> = self.party_vk.lock().unwrap()
             .iter()
-            .map(|node_vk_arc| node_vk_arc.clone().to_no_vk())
+            .map(|node_vk_arc| (**node_vk_arc).clone())
             .collect();
 
         let setup_msg = SetupMessage::new(
             self.instance.into(),
-            NoSigningKey,
+            &self.secret_key,
             self.party_id.into(),
-            no_vk_vec,
+            vk_vec,
             &ranks,
             self.threshold.into()
         );

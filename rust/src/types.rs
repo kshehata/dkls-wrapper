@@ -4,6 +4,8 @@ use core::pin::Pin;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use k256::elliptic_curve::group::GroupEncoding;
+use k256::ecdsa::{SigningKey, VerifyingKey};
+use signature::{Signer, Verifier};
 
 use crate::error::{GeneralError, NetworkError};
 
@@ -70,27 +72,104 @@ impl Keyshare {
  * Placeholders for keys.
  *****************************************************************************/
 
-#[derive(uniffi::Object)]
-pub struct NodeSecretKey { }
+#[derive(Clone, uniffi::Object)]
+pub struct NodeSecretKey {
+    inner: SigningKey,
+    bytes: Box<[u8]>,
+}
+
+#[uniffi::export]
+impl NodeSecretKey {
+    #[uniffi::constructor]
+    pub fn from_entropy() -> Self {
+        let mut rnd = ChaCha20Rng::from_entropy();
+        let inner = SigningKey::random(&mut rnd);
+        Self {
+            bytes: inner.to_bytes().to_vec().into_boxed_slice(),
+            inner,
+        }
+    }
+
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
+        let inner = SigningKey::try_from(bytes.as_slice())
+            .map_err(|_| GeneralError::InvalidInput("Invalid sk encoding".to_string()))?;
+        Ok(Self { inner, bytes: bytes.into_boxed_slice() })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.bytes.to_vec()
+    }
+}
+
+impl Into<SigningKey> for NodeSecretKey {
+    fn into(self) -> SigningKey {
+        self.inner
+    }   
+}
+
+impl AsRef<[u8]> for NodeSecretKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Signer<k256::ecdsa::Signature> for NodeSecretKey {
+    fn try_sign(&self, msg: &[u8]) -> Result<k256::ecdsa::Signature, signature::Error> {
+        self.inner.try_sign(msg)
+    }
+}
+
+impl Signer<k256::ecdsa::Signature> for &NodeSecretKey {
+    fn try_sign(&self, msg: &[u8]) -> Result<k256::ecdsa::Signature, signature::Error> {
+        self.inner.try_sign(msg)
+    }
+}
 
 #[derive(Clone, uniffi::Object)]
-pub struct NodeVerifyingKey(sl_dkls23::setup::NoVerifyingKey);
-
-impl From<sl_dkls23::setup::NoVerifyingKey> for NodeVerifyingKey {
-    fn from(value: sl_dkls23::setup::NoVerifyingKey) -> Self {
-        Self(value)
-    }
+pub struct NodeVerifyingKey {
+    inner: VerifyingKey,
+    bytes: Box<[u8]>,
 }
 
-impl From<usize> for NodeVerifyingKey {
-    fn from(value: usize) -> Self {
-        Self(sl_dkls23::setup::NoVerifyingKey::new(value))
-    }
-}
-
+#[uniffi::export]
 impl NodeVerifyingKey {
-    pub fn to_no_vk(&self) -> sl_dkls23::setup::NoVerifyingKey {
-        self.0.clone()
+    #[uniffi::constructor]
+    pub fn from_sk(sk: &NodeSecretKey) -> Self {
+        let inner = VerifyingKey::from(&sk.inner);
+        Self {
+            bytes: inner.to_encoded_point(false).as_bytes().to_vec().into_boxed_slice(),
+            inner,
+        }
+    }
+
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
+        let inner = VerifyingKey::try_from(bytes.as_slice())
+            .map_err(|_| GeneralError::InvalidInput("Invalid vk encoding".to_string()))?;
+        Ok(Self { inner, bytes: bytes.into_boxed_slice() })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.bytes.to_vec()
+    }
+}
+
+impl Into<VerifyingKey> for NodeVerifyingKey {
+    fn into(self) -> VerifyingKey {
+        self.inner
+    }
+}
+
+impl AsRef<[u8]> for NodeVerifyingKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
+    fn verify(&self, msg: &[u8], signature: &k256::ecdsa::Signature) -> Result<(), signature::Error> {
+        self.inner.verify(msg, signature)
     }
 }
 
