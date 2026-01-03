@@ -48,9 +48,10 @@ class MQTTInterface: NetworkInterface {
             }
 
             // Add listener for messages
-            client.addPublishListener(named: "dkls_listener") { result in
+            client.addPublishListener(named: topic) { result in
                 switch result {
                 case .success(let packet):
+                    guard packet.topicName == topic else { return }
                     var buffer = packet.payload
                     if let data = buffer.readData(length: buffer.readableBytes) {
                         continuation.yield(data)
@@ -62,7 +63,7 @@ class MQTTInterface: NetworkInterface {
 
             continuation.onTermination = { @Sendable _ in
                 let _ = client.unsubscribe(from: [topic])
-                client.removePublishListener(named: "dkls_listener")
+                client.removePublishListener(named: topic)
             }
         }
     }
@@ -90,45 +91,57 @@ struct DKLSCLI {
         print(colorize("DKLS CLI DKG Test", .cyan))
         print()
 
-        // Parse arguments
+        let dkgNode: DkgNode
         let args = ProcessInfo.processInfo.arguments
-        guard args.count >= 5 else {
+        if args.count <= 1 {
+            print(colorize("Paste the setup string from the other party:", .red))
+            let setupString = readLine()!
+            do {
+                dkgNode = try DkgNode.fromSetupString(setupStr: setupString)
+            } catch {
+                print(colorize("Error parsing setup string", .red))
+                exit(1)
+            }
+
+        } else if args.count == 3 {
+            let instanceID: InstanceId
+            if args[1] == "-" {
+                instanceID = InstanceId.fromEntropy()
+            } else {
+                guard let data = Data(base64Encoded: args[1]) else {
+                    print(colorize("Error: Invalid base64 for Instance ID", .red))
+                    exit(1)
+                }
+                do {
+                    instanceID = try InstanceId.fromBytes(bytes: data)
+                } catch {
+                    print(colorize("Error: Invalid Instance ID bytes", .red))
+                    exit(1)
+                }
+            }
+            let threshold = UInt8(args[2])!
+            dkgNode = DkgNode.starter(instance: instanceID, threshold: threshold)
+
+        } else {
             print(
                 colorize(
-                    "Usage: \(args[0]) <instanceID|-> <numParties> <threshold> <partyIndex>",
+                    "Usage: \(args[0]) <instanceID|-> <threshold>",
                     .red))
             return
         }
 
-        let numParties = UInt8(args[2])!
-        let threshold = UInt8(args[3])!
-        let partyIndex = UInt8(args[4])!
-
-        let instanceID: InstanceId
-        if args[1] == "-" {
-            instanceID = InstanceId.fromEntropy()
-        } else {
-            guard let data = Data(base64Encoded: args[1]) else {
-                print(colorize("Error: Invalid base64 for Instance ID", .red))
-                exit(1)
-            }
-            do {
-                instanceID = try InstanceId.fromBytes(bytes: data)
-            } catch {
-                print(colorize("Error: Invalid Instance ID bytes", .red))
-                exit(1)
-            }
-        }
-
-        print(colorize("🆔 Using Instance ID: \(instanceID.toBytes().base64EncodedString())", .cyan))
+        let instanceStr = hexString(dkgNode.instanceId().toBytes())
         print(
-            colorize("Settings: n = \(numParties), t = \(threshold), i = \(partyIndex)", .cyan))
-
-        print(colorize("Setting up DKG node...", .yellow))
-        let dkgNode = DkgNode.forId(
-            instance: instanceID, threshold: threshold, numParties: numParties,
-            partyId: partyIndex)
-        print(colorize("✓ DKG node set up", .green))
+            colorize(
+                "🆔 Using Instance ID: \(instanceStr)",
+                .cyan))
+        print(
+            colorize(
+                "Settings: n = \(dkgNode.threshold()), t = \(dkgNode.threshold()), i = \(dkgNode.partyId())",
+                .cyan))
+        print(colorize("Setup string:", .cyan))
+        print(dkgNode.setupString())
+        print()
 
         let client = MQTTClient(
             host: ProcessInfo.processInfo.environment["MQTT_HOST"] ?? "localhost",
@@ -149,15 +162,58 @@ struct DKLSCLI {
         }
 
         print(colorize("👂 Listening for messages...", .yellow))
+        let setupInterface = MQTTInterface(
+            client: client,
+            topic: "dkg_setup/\(instanceStr)"
+        )
+
+        Task {
+            do {
+                print(colorize("Waiting for other party's setup string...", .yellow))
+                while true {
+                    let data = try await setupInterface.receive()
+                    if let text = String(data: data, encoding: .utf8) {
+                        print()
+                        print(colorize("Received Setup String:", .magenta))
+                        print("  \(text)")
+                        do {
+                            try dkgNode.updateFrom(setupStr: text)
+                        } catch {
+                            print(colorize("Error updating from setup string: \(error)", .red))
+                        }
+                    } else {
+                        print()
+                        print(
+                            colorize(
+                                "Received \(data.count) bytes but couldn't parse UTF-8??", .red))
+                    }
+                }
+            } catch {
+                print(colorize("Error receiving messages: \(error)", .red))
+            }
+        }
+
         let service = MQTTInterface(
             client: client,
-            topic: "dkg/\(hexString(instanceID.toBytes()))"
+            topic: "dkg/\(instanceStr)"
         )
+
         print(colorize("✓ Connected to message stream", .green))
         print()
 
-        print(colorize("Ready. Press enter to start.", .magenta))
-        _ = readLine()
+        do {
+            try await setupInterface.send(
+                data: dkgNode.setupString().data(using: .utf8)!)
+            print(colorize("✓ Sent setup string", .green))
+        } catch {
+            print(colorize("Error sending setup string: \(error)", .red))
+            exit(1)
+        }
+
+        await Task.detached {
+            print(colorize("Ready. Press enter to start.", .magenta))
+            _ = readLine()
+        }.value
 
         do {
             print(colorize("Generating key shares...", .yellow))

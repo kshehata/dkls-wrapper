@@ -205,6 +205,15 @@ pub struct SignedMessage {
 }
 
 impl SignedMessage {
+    #[uniffi::constructor]
+    pub fn from_string(s: String) -> Result<Self, GeneralError> {
+        serde_json::from_str(&s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
     pub fn sign(msg: &Vec<u8>, sk: &NodeSecretKey) -> Result<Self, GeneralError> {
         let signature = sk
             .try_sign(msg)
@@ -235,6 +244,18 @@ pub struct DKGSetupMessage {
     pub party_vk: Vec<NodeVerifyingKey>,
 }
 
+#[uniffi::export]
+impl DKGSetupMessage {
+    #[uniffi::constructor]
+    pub fn from_string(s: &String) -> Result<Self, GeneralError> {
+        serde_json::from_str(s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,8 +276,8 @@ mod tests {
             party_id: party_id as u8,
             party_vk,
         };
-        let serialized = serde_json::to_string(&setup_msg).unwrap();
-        let deserialized: DKGSetupMessage = serde_json::from_str(&serialized).unwrap();
+        let serialized = setup_msg.to_string();
+        let deserialized: DKGSetupMessage = DKGSetupMessage::from_string(&serialized).unwrap();
         assert_eq!(setup_msg, deserialized);
 
         let signed_msg = SignedMessage::sign(&serialized.into_bytes(), &secret_keys[party_id]).unwrap();

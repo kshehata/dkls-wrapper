@@ -8,6 +8,8 @@ pub enum GeneralError {
     InvalidInput(String),
     #[error("Invalid signature: {0}")]
     SignatureError(String),
+    #[error("Invalid setup message")]
+    InvalidSetupMessage,
     #[error("Internal failure")]
     Generic,
 }

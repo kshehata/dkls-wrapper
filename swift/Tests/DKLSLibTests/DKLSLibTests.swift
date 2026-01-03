@@ -12,10 +12,10 @@ import Testing
     var nodes: [DkgNode] = [DkgNode.starter(instance: instance, threshold: 2)]
     for i in 1...2 {
         nodes.append(
-            DkgNode.init(instance: instance, threshold: 2, partyVk: nodes[i - 1].partyVk()))
-        let new_vk = nodes[i].myVk()
+            try DkgNode.fromSetupString(setupStr: nodes[i - 1].setupString()))
+        let setupStr = nodes[i].setupString()
         for j in 0..<i {
-            nodes[j].addParty(partyVk: new_vk)
+            try nodes[j].updateFrom(setupStr: setupStr)
         }
     }
     let runner = DkgRunner.init()
