@@ -12,10 +12,10 @@ import Testing
     var nodes: [DkgNode] = [DkgNode.starter(instance: instance, threshold: 2)]
     for i in 1...2 {
         nodes.append(
-            try DkgNode.fromSetupString(setupStr: nodes[i - 1].setupString()))
-        let setupStr = nodes[i].setupString()
+            try DkgNode.fromSetupBytes(setup: nodes[i - 1].setupBytes()))
+        let setup = nodes[i].setupBytes()
         for j in 0..<i {
-            try nodes[j].updateFrom(setupStr: setupStr)
+            try nodes[j].updateFromBytes(setup: setup)
         }
     }
     let runner = DkgRunner.init()

@@ -109,6 +109,11 @@ impl DKGNode {
         Ok(DKGNode::from_setup(DKGSetupMessage::from_string(setup_str)?))
     }
 
+    #[uniffi::constructor]
+    pub fn from_setup_bytes(setup: &Vec<u8>) -> Result<Self, GeneralError> {
+        Ok(DKGNode::from_setup(DKGSetupMessage::from_bytes(setup)?))
+    }
+
     pub fn setup_string(&self) -> String {
         // Move the VK vector so we can serialize without copying it.
         let mut vks = self.party_vk.lock().unwrap();
@@ -124,8 +129,27 @@ impl DKGNode {
         s
     }
 
-    pub fn update_from(&self, setup_str: &String) -> Result<(), GeneralError> {
-        self.update(DKGSetupMessage::from_string(setup_str)?)
+    pub fn setup_bytes(&self) -> Vec<u8> {
+        // Move the VK vector so we can serialize without copying it.
+        let mut vks = self.party_vk.lock().unwrap();
+        let old_vks = std::mem::take(&mut *vks);
+        let msg = DKGSetupMessage {
+            instance: self.instance,
+            threshold: self.threshold,
+            party_id: self.party_id,
+            party_vk: old_vks,
+        };
+        let bytes = msg.to_bytes();
+        *vks = msg.party_vk;
+        bytes
+    }
+
+    pub fn update_from_string(&self, setup: &String) -> Result<(), GeneralError> {
+        self.update(DKGSetupMessage::from_string(setup)?)
+    }
+
+    pub fn update_from_bytes(&self, setup: &Vec<u8>) -> Result<(), GeneralError> {
+        self.update(DKGSetupMessage::from_bytes(setup)?)
     }
 
     pub fn instance_id(&self) -> InstanceId {
@@ -200,10 +224,10 @@ mod tests {
         let mut nodes = vec![DKGNode::starter(&instance, 2)];
         for i in 1..3 {
             println!("Adding node {}", i);
-            nodes.push(DKGNode::from_setup_string(&nodes[i-1].setup_string()).unwrap());
-            let new_setup = nodes[i].setup_string();
+            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes()).unwrap());
+            let new_setup = nodes[i].setup_bytes();
             for j in 0..i {
-                nodes[j].update_from(&new_setup).unwrap();
+                nodes[j].update_from_bytes(&new_setup).unwrap();
             }
         }
 

@@ -71,7 +71,7 @@ impl Keyshare {
 
 
 /*****************************************************************************
- * Placeholders for keys.
+ * Keys for signing messages.
  *****************************************************************************/
 
 #[derive(Clone, uniffi::Object)]
@@ -140,7 +140,7 @@ impl NodeVerifyingKey {
     pub fn from_sk(sk: &NodeSecretKey) -> Self {
         let inner = VerifyingKey::from(&sk.inner);
         Self {
-            bytes: inner.to_encoded_point(false).as_bytes().to_vec().into_boxed_slice(),
+            bytes: inner.to_encoded_point(true).as_bytes().to_vec().into_boxed_slice(),
             inner,
         }
     }
@@ -197,45 +197,6 @@ impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
 /*****************************************************************************
  * Messages
  *****************************************************************************/
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, uniffi::Object)]
-pub struct SignedMessage {
-    pub message: Vec<u8>,
-    pub signature: Vec<u8>,
-}
-
-impl SignedMessage {
-    #[uniffi::constructor]
-    pub fn from_string(s: String) -> Result<Self, GeneralError> {
-        serde_json::from_str(&s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
-    }
-
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-
-    pub fn sign(msg: &Vec<u8>, sk: &NodeSecretKey) -> Result<Self, GeneralError> {
-        let signature = sk
-            .try_sign(msg)
-            .map_err(|e| GeneralError::SignatureError(e.to_string()))?;
-
-        Ok(Self {
-            message: msg.clone(),
-            signature: signature.to_bytes().to_vec(),
-        })
-    }
-}
-
-#[uniffi::export]
-impl SignedMessage {
-    pub fn verify(&self, vk: &NodeVerifyingKey) -> Result<(), GeneralError> {
-        let signature = k256::ecdsa::Signature::try_from(self.signature.as_slice())
-            .map_err(|e| GeneralError::SignatureError(e.to_string()))?;
-        vk.verify(&self.message, &signature)
-            .map_err(|e| GeneralError::SignatureError(e.to_string()))
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object, Serialize, Deserialize)]
 pub struct DKGSetupMessage {
     pub instance: InstanceId,
@@ -253,6 +214,15 @@ impl DKGSetupMessage {
 
     pub fn to_string(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &Vec<u8>) -> Result<Self, GeneralError> {
+        postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap()
     }
 }
 
@@ -279,9 +249,27 @@ mod tests {
         let serialized = setup_msg.to_string();
         let deserialized: DKGSetupMessage = DKGSetupMessage::from_string(&serialized).unwrap();
         assert_eq!(setup_msg, deserialized);
+    }
 
-        let signed_msg = SignedMessage::sign(&serialized.into_bytes(), &secret_keys[party_id]).unwrap();
-        assert!(signed_msg.verify(&setup_msg.party_vk[party_id]).is_ok());
+    #[test]
+    fn test_dkg_setup_message_postcard() {
+        let instance = InstanceId::from_entropy();
+        let secret_keys = vec![
+            NodeSecretKey::from_entropy(),
+            NodeSecretKey::from_entropy(),
+            NodeSecretKey::from_entropy(),
+        ];
+        let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
+        let party_id = 0usize;
+        let setup_msg = DKGSetupMessage {
+            instance,
+            threshold: 2,
+            party_id: party_id as u8,
+            party_vk,
+        };
+        let serialized = setup_msg.to_bytes();
+        let deserialized: DKGSetupMessage = DKGSetupMessage::from_bytes(&serialized).unwrap();
+        assert_eq!(setup_msg, deserialized);
     }
 }
 

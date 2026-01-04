@@ -94,12 +94,12 @@ struct DKLSCLI {
         let dkgNode: DkgNode
         let args = ProcessInfo.processInfo.arguments
         if args.count <= 1 {
-            print(colorize("Paste the setup string from the other party:", .red))
-            let setupString = readLine()!
+            print(colorize("Paste the setup bytes from the other party:", .red))
+            let setupBase64 = readLine()!
             do {
-                dkgNode = try DkgNode.fromSetupString(setupStr: setupString)
+                dkgNode = try DkgNode.fromSetupBytes(setup: Data(base64Encoded: setupBase64)!)
             } catch {
-                print(colorize("Error parsing setup string", .red))
+                print(colorize("Error parsing setup bytes", .red))
                 exit(1)
             }
 
@@ -139,8 +139,8 @@ struct DKLSCLI {
             colorize(
                 "Settings: n = \(dkgNode.threshold()), t = \(dkgNode.threshold()), i = \(dkgNode.partyId())",
                 .cyan))
-        print(colorize("Setup string:", .cyan))
-        print(dkgNode.setupString())
+        print(colorize("Setup bytes:", .cyan))
+        print(dkgNode.setupBytes().base64EncodedString())
         print()
 
         let client = MQTTClient(
@@ -172,20 +172,11 @@ struct DKLSCLI {
                 print(colorize("Waiting for other party's setup string...", .yellow))
                 while true {
                     let data = try await setupInterface.receive()
-                    if let text = String(data: data, encoding: .utf8) {
-                        print()
-                        print(colorize("Received Setup String:", .magenta))
-                        print("  \(text)")
-                        do {
-                            try dkgNode.updateFrom(setupStr: text)
-                        } catch {
-                            print(colorize("Error updating from setup string: \(error)", .red))
-                        }
-                    } else {
-                        print()
-                        print(
-                            colorize(
-                                "Received \(data.count) bytes but couldn't parse UTF-8??", .red))
+                    print(colorize("Received Setup String: \(data.count) bytes", .magenta))
+                    do {
+                        try dkgNode.updateFromBytes(setup: data)
+                    } catch {
+                        print(colorize("Error updating from received setup: \(error)", .red))
                     }
                 }
             } catch {
@@ -202,8 +193,7 @@ struct DKLSCLI {
         print()
 
         do {
-            try await setupInterface.send(
-                data: dkgNode.setupString().data(using: .utf8)!)
+            try await setupInterface.send(data: dkgNode.setupBytes())
             print(colorize("✓ Sent setup string", .green))
         } catch {
             print(colorize("Error sending setup string: \(error)", .red))
