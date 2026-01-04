@@ -19,8 +19,8 @@ let package = Package(
             targets: ["DKLSLib"]
         ),
         .executable(
-            name: "DKLSCLI",
-            targets: ["DKLSCLI"]
+            name: "dkg",
+            targets: ["CLIKeyGen"]
         ),
     ],
     dependencies: [
@@ -36,9 +36,17 @@ let package = Package(
             name: "DKLSLib",
             dependencies: ["libdkls-rs"]
         ),
-        .executableTarget(
-            name: "DKLSCLI",
+        .target(
+            name: "CLICore",
             dependencies: [
+                "DKLSLib",
+                .product(name: "MQTTNIO", package: "mqtt-nio"),
+            ]
+        ),
+        .executableTarget(
+            name: "CLIKeyGen",
+            dependencies: [
+                "CLICore",
                 "DKLSLib",
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
             ]
