@@ -85,6 +85,14 @@ func hexString(_ data: Data) -> String {
     return data.map { String(format: "%02x", $0) }.joined()
 }
 
+func checkWriteable(_ path: String) -> Bool {
+    let fm = FileManager.default
+    let dest = path
+    let parent = (dest as NSString).deletingLastPathComponent
+    let checkPath = fm.fileExists(atPath: dest) ? dest : (parent.isEmpty ? "." : parent)
+    return fm.isWritableFile(atPath: checkPath)
+}
+
 @main
 struct DKLSCLI {
     static func main() async {
@@ -93,7 +101,7 @@ struct DKLSCLI {
 
         let dkgNode: DkgNode
         let args = ProcessInfo.processInfo.arguments
-        if args.count <= 1 {
+        if args.count <= 2 {
             print(colorize("Paste the setup bytes from the other party:", .red))
             let setupBase64 = readLine()!
             do {
@@ -103,7 +111,7 @@ struct DKLSCLI {
                 exit(1)
             }
 
-        } else if args.count == 3 {
+        } else if args.count == 3 || args.count == 4 {
             let instanceID: InstanceId
             if args[1] == "-" {
                 instanceID = InstanceId.fromEntropy()
@@ -125,10 +133,27 @@ struct DKLSCLI {
         } else {
             print(
                 colorize(
-                    "Usage: \(args[0]) <instanceID|-> <threshold>",
+                    "Usage: \(args[0]) <instanceID|-> <threshold> <outputFilename>",
                     .red))
             return
         }
+
+        let outputFilename: String
+        if args.count == 4 {
+            outputFilename = args[3]
+        } else if args.count == 2 {
+            outputFilename = args[1]
+        } else {
+            outputFilename = "keyshare\(dkgNode.partyId())"
+        }
+        if !checkWriteable(outputFilename) {
+            print(colorize("Error: Cannot write to \(outputFilename)", .red))
+            exit(1)
+        }
+        print(
+            colorize(
+                "Saving keyshare to \(outputFilename)",
+                .cyan))
 
         let instanceStr = hexString(dkgNode.instanceId().toBytes())
         print(
@@ -211,6 +236,9 @@ struct DKLSCLI {
             print(colorize("✓ Key shares generated", .green))
             print()
             share.print()
+            print(colorize("Key share bytes: \(share.toBytes().count) bytes", .magenta))
+            try share.toBytes().write(to: URL(fileURLWithPath: outputFilename))
+            print(colorize("✓ Key share written to \(outputFilename)", .green))
         } catch {
             print(colorize("Error: \(error)", .red))
         }
