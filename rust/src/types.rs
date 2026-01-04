@@ -63,6 +63,17 @@ pub struct Keyshare(pub sl_dkls23::keygen::Keyshare);
 
 #[uniffi::export]
 impl Keyshare {
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
+        let inner = sl_dkls23::keygen::Keyshare::from_bytes(bytes)
+            .ok_or(GeneralError::InvalidInput("Invalid KeyShare encoding".to_string()))?;
+        Ok(Self(inner))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.as_slice().to_vec()
+    }
+
     pub fn print(&self) {
         println!("PK={} SK={}", hex::encode(self.0.public_key().to_bytes()),
             hex::encode(self.0.s_i().to_bytes()));
