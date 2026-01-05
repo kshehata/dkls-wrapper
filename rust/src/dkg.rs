@@ -1,17 +1,14 @@
 
 use std::sync::{Arc, Mutex};
-use k256::elliptic_curve::group::GroupEncoding;
-use k256::ecdsa::{SigningKey, VerifyingKey};
+
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use tokio::runtime::Runtime;
-use tokio::task::spawn_blocking;
+
 use std::sync::OnceLock;
 
-use sl_dkls23::setup::{
-    keygen::SetupMessage, NoSigningKey, NoVerifyingKey,
-};
+use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 use sl_dkls23::keygen::run as keygen_run;
 use sl_dkls23::Relay;
 
@@ -20,70 +17,43 @@ use crate::types::*;
 
 #[derive(uniffi::Object)]
 pub struct DKGNode {
-    instance: InstanceId,
-    threshold: u8,
-    party_id: u8,
-    party_vk: Mutex<Vec<NodeVerifyingKey>>,
-    secret_key: NodeSecretKey,
+    pub setup: SetupMessage,
+    pub party_id: u8,
+    pub secret_key: NodeSecretKey,
 }
 
 impl DKGNode {
-    pub fn from_setup(mut setup_msg: DKGSetupMessage) -> Self {
-        let my_id = setup_msg.party_vk.len() as u8;
+    pub fn from_setup(setup_msg: SetupMessage) -> Self {
+        let mut party_vk = setup_msg.party_vk.lock().unwrap();
+        let my_id = party_vk.len() as u8;
         let secret_key = NodeSecretKey::from_entropy();
-        setup_msg.party_vk.push(NodeVerifyingKey::from_sk(&secret_key));
+        party_vk.push(NodeVerifyingKey::from_sk(&secret_key));
+        // drop the lock
+        drop(party_vk);
         Self {
-            instance: setup_msg.instance,
-            threshold: setup_msg.threshold,
+            setup: setup_msg,
             party_id: my_id,
-            party_vk: Mutex::new(setup_msg.party_vk),
             secret_key,
         }
     }
 
-    pub fn update(&self, setup_msg: DKGSetupMessage) -> Result<(), GeneralError> {
-        // Lock the vk vector for the entire function.
-        let mut party_vk = self.party_vk.lock().unwrap();
-
-        // Make sure setup is consistent.
-        if setup_msg.instance != self.instance
-            || setup_msg.threshold != self.threshold
-            || setup_msg.party_vk.len() < party_vk.len()
-        {
-            return Err(GeneralError::InvalidSetupMessage);
-        }
-
-        // If any of the keys are different, reject the setup.
-        if party_vk.as_slice() != &setup_msg.party_vk[..party_vk.len()] {
-            return Err(GeneralError::InvalidSetupMessage);
-        }
-
-        // Replace the local vector with the one received.
-        *party_vk = setup_msg.party_vk;
-        Ok(())
-    }
-
-    // NB: this function consumes the VK vector!
     pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
-        let ranks = vec![0u8; self.party_vk.lock().unwrap().len()];
-
-        let vks = {
-            let mut lock = self.party_vk.lock().unwrap();
-            std::mem::take(&mut *lock)
-        };
-
-        let setup_msg = SetupMessage::new(
-            self.instance.into(),
+        let party_vk = self.setup.party_vk.lock().unwrap().clone();
+        let ranks = vec![0u8; party_vk.len()];
+        // Have to clone the VK vector here or we'll lose it.
+        let setup_msg = KeygenSetup::new(
+            self.setup.instance.into(),
             &self.secret_key,
             self.party_id.into(),
-            vks,
+            party_vk,
             &ranks,
-            self.threshold.into()
+            self.setup.threshold.into()
         );
         let mut rng = ChaCha20Rng::from_entropy();
+
         keygen_run(setup_msg, rng.gen(), relay)
             .await
-            .map(|k| Keyshare(k))
+            .map(|k| Keyshare(Arc::new(k)))
             .map_err(KeygenError::from)
     }
 }
@@ -96,68 +66,48 @@ impl DKGNode {
         let secret_key = NodeSecretKey::from_entropy();
         let party_vk = vec![NodeVerifyingKey::from_sk(&secret_key)];
         Self {
-            instance: *instance,
-            threshold,
+            setup: SetupMessage {
+                instance: *instance,
+                threshold,
+                party_vk: Mutex::new(party_vk),
+            },
             party_id: 0,
-            party_vk: Mutex::new(party_vk),
-            secret_key,
+            secret_key, 
         }
     }
 
     #[uniffi::constructor]
     pub fn from_setup_string(setup_str: &String) -> Result<Self, GeneralError> {
-        Ok(DKGNode::from_setup(DKGSetupMessage::from_string(setup_str)?))
+        Ok(DKGNode::from_setup(SetupMessage::from_string(setup_str)?))
     }
 
     #[uniffi::constructor]
     pub fn from_setup_bytes(setup: &Vec<u8>) -> Result<Self, GeneralError> {
-        Ok(DKGNode::from_setup(DKGSetupMessage::from_bytes(setup)?))
+        Ok(DKGNode::from_setup(SetupMessage::from_bytes(setup)?))
     }
 
     pub fn setup_string(&self) -> String {
-        // Move the VK vector so we can serialize without copying it.
-        let mut vks = self.party_vk.lock().unwrap();
-        let old_vks = std::mem::take(&mut *vks);
-        let msg = DKGSetupMessage {
-            instance: self.instance,
-            threshold: self.threshold,
-            party_id: self.party_id,
-            party_vk: old_vks,
-        };
-        let s = msg.to_string();
-        *vks = msg.party_vk;
-        s
+        self.setup.to_string()
     }
 
     pub fn setup_bytes(&self) -> Vec<u8> {
-        // Move the VK vector so we can serialize without copying it.
-        let mut vks = self.party_vk.lock().unwrap();
-        let old_vks = std::mem::take(&mut *vks);
-        let msg = DKGSetupMessage {
-            instance: self.instance,
-            threshold: self.threshold,
-            party_id: self.party_id,
-            party_vk: old_vks,
-        };
-        let bytes = msg.to_bytes();
-        *vks = msg.party_vk;
-        bytes
+        self.setup.to_bytes()
     }
 
     pub fn update_from_string(&self, setup: &String) -> Result<(), GeneralError> {
-        self.update(DKGSetupMessage::from_string(setup)?)
+        self.setup.update(SetupMessage::from_string(setup)?)
     }
 
     pub fn update_from_bytes(&self, setup: &Vec<u8>) -> Result<(), GeneralError> {
-        self.update(DKGSetupMessage::from_bytes(setup)?)
+        self.setup.update(SetupMessage::from_bytes(setup)?)
     }
 
     pub fn instance_id(&self) -> InstanceId {
-        self.instance
+        self.setup.instance
     }
 
     pub fn threshold(&self) -> u8 {
-        self.threshold
+        self.setup.threshold
     }
 
     pub fn party_id(&self) -> u8 {
@@ -216,6 +166,7 @@ impl DKGRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::elliptic_curve::group::GroupEncoding;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_dkg_node() {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use futures::{Future, sink, Sink, SinkExt, Stream, StreamExt};
 use core::pin::Pin;
 use rand::{Rng, SeedableRng};
@@ -58,8 +58,8 @@ impl Into<sl_dkls23::InstanceId> for InstanceId {
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct Keyshare(pub sl_dkls23::keygen::Keyshare);
+#[derive(Clone, uniffi::Object)]
+pub struct Keyshare(pub Arc<sl_dkls23::keygen::Keyshare>);
 
 #[uniffi::export]
 impl Keyshare {
@@ -67,7 +67,7 @@ impl Keyshare {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
         let inner = sl_dkls23::keygen::Keyshare::from_bytes(bytes)
             .ok_or(GeneralError::InvalidInput("Invalid KeyShare encoding".to_string()))?;
-        Ok(Self(inner))
+        Ok(Self(Arc::new(inner)))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -77,6 +77,12 @@ impl Keyshare {
     pub fn print(&self) {
         println!("PK={} SK={}", hex::encode(self.0.public_key().to_bytes()),
             hex::encode(self.0.s_i().to_bytes()));
+    }
+}
+
+impl Keyshare {
+    pub fn vk(&self) -> VerifyingKey {
+        VerifyingKey::from_affine(self.0.public_key().to_affine()).unwrap()
     }
 }
 
@@ -208,17 +214,45 @@ impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
 /*****************************************************************************
  * Messages
  *****************************************************************************/
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object, Serialize, Deserialize)]
-pub struct DKGSetupMessage {
+
+// To set up any operation we need to know the verification keys of all parties
+// and determine an ordering for them. Basic idea is that new parties scan the
+// QR code of an existing member, then send a network message to update
+// existing parties.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetupMessage {
     pub instance: InstanceId,
     pub threshold: u8,
-    pub party_id: u8,
-    pub party_vk: Vec<NodeVerifyingKey>,
+    pub party_vk: Mutex<Vec<NodeVerifyingKey>>,
 }
 
-#[uniffi::export]
-impl DKGSetupMessage {
-    #[uniffi::constructor]
+impl SetupMessage {
+    // Update setup from a received message.
+    // Checks that instance, threshold, and all previous keys are the same,
+    // and adds new keys to the store.
+    pub fn update(&self, setup_msg: SetupMessage) -> Result<(), GeneralError> {
+        // Lock the vk vector for the entire function.
+        let mut old_party_vk = self.party_vk.lock().unwrap();
+        let new_party_vk = setup_msg.party_vk.into_inner().unwrap();
+
+        // Make sure setup is consistent.
+        if setup_msg.instance != self.instance
+            || setup_msg.threshold != self.threshold
+            || new_party_vk.len() < old_party_vk.len()
+        {
+            return Err(GeneralError::InvalidSetupMessage);
+        }
+
+        // If any of the keys are different, reject the setup.
+        if old_party_vk.as_slice() != &new_party_vk[..old_party_vk.len()] {
+            return Err(GeneralError::InvalidSetupMessage);
+        }
+
+        // Replace the local vector with the one received.
+        *old_party_vk = new_party_vk;
+        Ok(())
+    }
+
     pub fn from_string(s: &String) -> Result<Self, GeneralError> {
         serde_json::from_str(s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
     }
@@ -227,7 +261,6 @@ impl DKGSetupMessage {
         serde_json::to_string(self).unwrap()
     }
 
-    #[uniffi::constructor]
     pub fn from_bytes(bytes: &Vec<u8>) -> Result<Self, GeneralError> {
         postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
     }
@@ -241,6 +274,17 @@ impl DKGSetupMessage {
 mod tests {
     use super::*;
 
+    impl PartialEq for SetupMessage {
+        fn eq(&self, other: &Self) -> bool {
+            // Note: .lock().unwrap() may panic if the mutex is poisoned
+            let self_val = self.party_vk.lock().unwrap();
+            let other_val = other.party_vk.lock().unwrap();
+            self.instance == other.instance
+                && self.threshold == other.threshold
+                && self_val.as_slice() == other_val.as_slice()
+        }
+    }
+
     #[test]
     fn test_dkg_setup_message() {
         let instance = InstanceId::from_entropy();
@@ -250,15 +294,13 @@ mod tests {
             NodeSecretKey::from_entropy(),
         ];
         let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
-        let party_id = 0usize;
-        let setup_msg = DKGSetupMessage {
+        let setup_msg = SetupMessage {
             instance,
             threshold: 2,
-            party_id: party_id as u8,
-            party_vk,
+            party_vk: Mutex::new(party_vk),
         };
         let serialized = setup_msg.to_string();
-        let deserialized: DKGSetupMessage = DKGSetupMessage::from_string(&serialized).unwrap();
+        let deserialized: SetupMessage = SetupMessage::from_string(&serialized).unwrap();
         assert_eq!(setup_msg, deserialized);
     }
 
@@ -271,15 +313,13 @@ mod tests {
             NodeSecretKey::from_entropy(),
         ];
         let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
-        let party_id = 0usize;
-        let setup_msg = DKGSetupMessage {
+        let setup_msg = SetupMessage {
             instance,
             threshold: 2,
-            party_id: party_id as u8,
-            party_vk,
+            party_vk: Mutex::new(party_vk),
         };
         let serialized = setup_msg.to_bytes();
-        let deserialized: DKGSetupMessage = DKGSetupMessage::from_bytes(&serialized).unwrap();
+        let deserialized: SetupMessage = SetupMessage::from_bytes(&serialized).unwrap();
         assert_eq!(setup_msg, deserialized);
     }
 }
