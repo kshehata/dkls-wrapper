@@ -293,6 +293,10 @@ impl SetupMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
     }
+
+    pub fn num_parties(&self) -> u8 {
+        self.party_vk.lock().unwrap().len() as u8
+    }
 }
 
 #[cfg(test)]

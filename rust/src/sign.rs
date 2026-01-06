@@ -4,6 +4,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use k256::sha2::{Sha256, Digest};
 use std::time::Duration;
+use serde::{Serialize, Deserialize};
 
 use sl_dkls23::setup::sign::SetupMessage as SignSetupMessage;
 use sl_dkls23::sign::run as sign_run;
@@ -11,15 +12,6 @@ use sl_dkls23::Relay;
 
 use crate::error::GeneralError;
 use crate::types::*;
-
-#[derive(uniffi::Object)]
-pub struct SignNode {
-    pub setup: SetupMessage,
-    pub party_id: u8,
-    pub secret_key: NodeSecretKey,
-    pub keyshare: Keyshare,
-}
-
 
 pub fn hash_message(message: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -31,50 +23,107 @@ pub fn hash_string(message: &str) -> [u8; 32] {
     hash_message(message.as_bytes())
 }
 
+
+// Message sent on the network to request or join a signature party.
+// TODO: to avoid race conditions, this needs to indicate sender or be signed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignRequest {
+    pub message: Vec<u8>,
+    pub hash: [u8; 32],
+    pub setup: SetupMessage,
+}
+
+impl SignRequest {
+    pub fn init(message: Vec<u8>, setup: SetupMessage) -> Self {
+        let hash = hash_message(&message);
+        Self { message, hash, setup }
+    }
+
+    pub fn for_message(message: &str, setup: SetupMessage) -> Self {
+        Self::init(message.as_bytes().to_vec(), setup)
+    }
+
+    pub fn from_string(s: &String) -> Result<Self, GeneralError> {
+        serde_json::from_str(s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    pub fn from_bytes(bytes: &Vec<u8>) -> Result<Self, GeneralError> {
+        postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap()
+    }
+
+    pub fn update(&self, req_msg: SignRequest) -> Result<(), GeneralError> {
+        if req_msg.message.len() > 0 && req_msg.message != self.message {
+            return Err(GeneralError::InvalidInput("Message mismatch".to_string()));
+        }
+        if req_msg.hash != self.hash {
+            return Err(GeneralError::InvalidInput("Hash mismatch".to_string()));
+        }
+        self.setup.update(req_msg.setup)
+    }
+}
+
+
+#[derive(uniffi::Object)]
+pub struct SignNode {
+    pub req: SignRequest,
+    pub party_id: u8,
+    pub secret_key: NodeSecretKey,
+    pub keyshare: Keyshare,
+}
+
 // TODO: we really should be reusing keys from the clients.
 impl SignNode {
-    pub fn from_setup(setup_msg: SetupMessage, keyshare: Keyshare) -> Self {
-        let mut party_vk = setup_msg.party_vk.lock().unwrap();
+    pub fn for_request(req_msg: SignRequest, keyshare: Keyshare) -> Self {
+        let mut party_vk = req_msg.setup.party_vk.lock().unwrap();
         let my_id = party_vk.len() as u8;
         let secret_key = NodeSecretKey::from_entropy();
         party_vk.push(NodeVerifyingKey::from_sk(&secret_key));
         // drop the lock
         drop(party_vk);
         Self {
-            setup: setup_msg,
+            req: req_msg,
             party_id: my_id,
             secret_key,
             keyshare,
         }
     }
 
-    pub async fn do_sign_relay<R: Relay>(&self, hash: [u8; 32], relay: R) -> Result<Signature, GeneralError> {
+    pub async fn do_sign_relay<R: Relay>(&self, relay: R) -> Result<Signature, GeneralError> {
         let setup_msg = SignSetupMessage::new(
-            self.setup.instance.into(),
+            self.req.setup.instance.into(),
             &self.secret_key,
             self.party_id.into(),
-            self.setup.party_vk.lock().unwrap().clone(),
+            self.req.setup.party_vk.lock().unwrap().clone(),
             self.keyshare.0.clone(),
         )
-        .with_hash(hash)
+        .with_hash(self.req.hash)
         .with_ttl(Duration::from_secs(1));
         let mut rng = ChaCha20Rng::from_entropy();
         Ok(Signature(sign_run(setup_msg, rng.gen(), relay).await?.0))
-    }
+    } 
 }
 
 #[uniffi::export]
 impl SignNode {
     #[uniffi::constructor]
-    pub fn starter(instance: &InstanceId, threshold: u8, keyshare: &Keyshare) -> Self {
+    pub fn starter(message: &str, instance: &InstanceId, threshold: u8, keyshare: &Keyshare) -> Self {
         let secret_key = NodeSecretKey::from_entropy();
         let party_vk = vec![NodeVerifyingKey::from_sk(&secret_key)];
         Self {
-            setup: SetupMessage {
-                instance: *instance,
-                threshold,
-                party_vk: Mutex::new(party_vk),
-            },
+            req: SignRequest::for_message(message,
+                SetupMessage {
+                    instance: *instance,
+                    threshold,
+                    party_vk: Mutex::new(party_vk),
+                }),
             party_id: 0,
             secret_key, 
             keyshare: keyshare.clone(),
@@ -82,49 +131,50 @@ impl SignNode {
     }
 
     #[uniffi::constructor]
-    pub fn from_setup_string(setup_str: &String, keyshare: &Keyshare) -> Result<Self, GeneralError> {
-        Ok(SignNode::from_setup(SetupMessage::from_string(setup_str)?, keyshare.clone()))
+    pub fn from_request_string(req_str: &String, keyshare: &Keyshare) -> Result<Self, GeneralError> {
+        Ok(SignNode::for_request(SignRequest::from_string(req_str)?, keyshare.clone()))
     }
 
     #[uniffi::constructor]
-    pub fn from_setup_bytes(setup: &Vec<u8>, keyshare: &Keyshare) -> Result<Self, GeneralError> {
-        Ok(SignNode::from_setup(SetupMessage::from_bytes(setup)?, keyshare.clone()))
+    pub fn from_request_bytes(req: &Vec<u8>, keyshare: &Keyshare) -> Result<Self, GeneralError> {
+        Ok(SignNode::for_request(SignRequest::from_bytes(req)?, keyshare.clone()))
     }
 
-    pub fn setup_string(&self) -> String {
-        self.setup.to_string()
+    pub fn request_string(&self) -> String {
+        self.req.to_string()
     }
 
-    pub fn setup_bytes(&self) -> Vec<u8> {
-        self.setup.to_bytes()
+    // TODO: We should drop the message when joining.
+    pub fn request_bytes(&self) -> Vec<u8> {
+        self.req.to_bytes()
     }
 
-    pub fn update_from_string(&self, setup: &String) -> Result<(), GeneralError> {
-        self.setup.update(SetupMessage::from_string(setup)?)
+    pub fn update_from_string(&self, req: &String) -> Result<(), GeneralError> {
+        self.req.update(SignRequest::from_string(req)?)
     }
 
-    pub fn update_from_bytes(&self, setup: &Vec<u8>) -> Result<(), GeneralError> {
-        self.setup.update(SetupMessage::from_bytes(setup)?)
+    pub fn update_from_bytes(&self, req: &Vec<u8>) -> Result<(), GeneralError> {
+        self.req.update(SignRequest::from_bytes(req)?)
     }
 
     pub fn instance_id(&self) -> InstanceId {
-        self.setup.instance
+        self.req.setup.instance
     }
 
     pub fn threshold(&self) -> u8 {
-        self.setup.threshold
+        self.req.setup.threshold
     }
 
     pub fn party_id(&self) -> u8 {
         self.party_id
     }
 
-    pub async fn sign_bytes(&self, message: &Vec<u8>, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
-        self.do_sign_relay(hash_message(message.as_slice()), create_network_relay(interface)).await
+    pub fn num_parties(&self) -> u8 {
+        self.req.setup.num_parties()
     }
 
-    pub async fn sign_string(&self, message: &String, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
-        self.do_sign_relay(hash_string(message.as_str()), create_network_relay(interface)).await
+    pub async fn do_sign(&self, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
+        self.do_sign_relay(create_network_relay(interface)).await
     }
 }
 
@@ -185,6 +235,10 @@ mod tests {
         let (_vks, _sks, shares) = gen_key_shares().await;
         let instance = InstanceId::from_entropy();
 
+        // Value to be signed
+        let message = "Hello World".to_string();
+        let vk = shares[0].vk();
+
         /*
         // let vks: Vec<NodeVerifyingKey> = vks.into_iter().take(2).collect();
         // OK, I think I finally get it. The KeyShares encode the x points.
@@ -194,14 +248,9 @@ mod tests {
         let sks = vec![sks[2].clone(), sks[0].clone()];
         let shares = vec![shares[1].clone(), shares[2].clone()];
         */
-        let mut nodes = vec![SignNode::starter(&instance, 2, &shares[2])];
-        nodes.push(SignNode::from_setup_bytes(&nodes[0].setup_bytes(), &shares[1]).unwrap());
-        nodes[0].update_from_bytes(&nodes[1].setup_bytes()).unwrap();
-
-        // Value to be signed
-        let message = "Hello World".to_string();
-        let hash = hash_string(&message);
-        let vk = shares[0].vk();
+        let mut nodes = vec![SignNode::starter(&message, &instance, 2, &shares[2])];
+        nodes.push(SignNode::from_request_bytes(&nodes[0].request_bytes(), &shares[1]).unwrap());
+        nodes[0].update_from_bytes(&nodes[1].request_bytes()).unwrap();
 
         // Simulate running each independently
         let mut parties = tokio::task::JoinSet::new();
@@ -212,7 +261,7 @@ mod tests {
             println!("Signing node {}", node.party_id);
             let relay = coord.connect();
             parties.spawn(async move {
-                node.do_sign_relay(hash, relay).await
+                node.do_sign_relay(relay).await
             });
         }
 
