@@ -3,7 +3,6 @@ use sl_dkls23::keygen::KeygenError as DklsKeygenError;
 use sl_dkls23::sign::SignError as DklsSignError;
 
 #[derive(Debug, Error, thiserror::Error)]
-#[uniffi(flat_error)]
 pub enum GeneralError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
