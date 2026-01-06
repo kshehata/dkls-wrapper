@@ -1,13 +1,12 @@
 
-use std::sync::Mutex;
-use k256::ecdsa::{Signature, RecoveryId};
+use std::sync::{Arc, Mutex};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-
+use k256::sha2::{Sha256, Digest};
 use std::time::Duration;
 
 use sl_dkls23::setup::sign::SetupMessage as SignSetupMessage;
-use sl_dkls23::sign::{run as sign_run, SignError};
+use sl_dkls23::sign::run as sign_run;
 use sl_dkls23::Relay;
 
 use crate::error::GeneralError;
@@ -19,6 +18,17 @@ pub struct SignNode {
     pub party_id: u8,
     pub secret_key: NodeSecretKey,
     pub keyshare: Keyshare,
+}
+
+
+pub fn hash_message(message: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(message);
+    hasher.finalize().into()
+} 
+
+pub fn hash_string(message: &str) -> [u8; 32] {
+    hash_message(message.as_bytes())
 }
 
 // TODO: we really should be reusing keys from the clients.
@@ -38,7 +48,7 @@ impl SignNode {
         }
     }
 
-    pub async fn do_sign_relay<R: Relay>(&self, hash: [u8; 32], relay: R) -> Result<(Signature, RecoveryId), SignError> {
+    pub async fn do_sign_relay<R: Relay>(&self, hash: [u8; 32], relay: R) -> Result<Signature, GeneralError> {
         let setup_msg = SignSetupMessage::new(
             self.setup.instance.into(),
             &self.secret_key,
@@ -49,7 +59,7 @@ impl SignNode {
         .with_hash(hash)
         .with_ttl(Duration::from_secs(1));
         let mut rng = ChaCha20Rng::from_entropy();
-        sign_run(setup_msg, rng.gen(), relay).await
+        Ok(Signature(sign_run(setup_msg, rng.gen(), relay).await?.0))
     }
 }
 
@@ -108,6 +118,14 @@ impl SignNode {
     pub fn party_id(&self) -> u8 {
         self.party_id
     }
+
+    pub async fn sign_bytes(&self, message: &Vec<u8>, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
+        self.do_sign_relay(hash_message(message.as_slice()), create_network_relay(interface)).await
+    }
+
+    pub async fn sign_string(&self, message: &String, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
+        self.do_sign_relay(hash_string(message.as_str()), create_network_relay(interface)).await
+    }
 }
 
 
@@ -115,8 +133,6 @@ impl SignNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use signature::Verifier;
     use crate::dkg::*;
 
     async fn gen_key_shares() -> (Vec<NodeVerifyingKey>, Vec<NodeSecretKey>, Vec<Arc<Keyshare>>) {
@@ -183,7 +199,8 @@ mod tests {
         nodes[0].update_from_bytes(&nodes[1].setup_bytes()).unwrap();
 
         // Value to be signed
-        let hash = [42u8; 32];
+        let message = "Hello World".to_string();
+        let hash = hash_string(&message);
         let vk = shares[0].vk();
 
         // Simulate running each independently
@@ -216,8 +233,8 @@ mod tests {
         }
         
         while let Some(res) = parties.join_next().await {
-            let (sig, _recid) = res.unwrap().unwrap();
-            assert!(vk.verify(&hash, &sig).is_ok());
+            let sig = res.unwrap().unwrap();
+            assert!(vk.verify(&message.as_bytes(), &sig).is_ok());
         }
     }
 }

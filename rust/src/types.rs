@@ -8,7 +8,7 @@ use k256::ecdsa::{SigningKey, VerifyingKey};
 use signature::{Signer, Verifier};
 use serde::{Serialize, Deserialize};
 
-use crate::error::{GeneralError, NetworkError};
+use crate::error::GeneralError;
 
 
 /*****************************************************************************
@@ -81,11 +81,27 @@ impl Keyshare {
 }
 
 impl Keyshare {
-    pub fn vk(&self) -> VerifyingKey {
-        VerifyingKey::from_affine(self.0.public_key().to_affine()).unwrap()
+    pub fn vk(&self) -> NodeVerifyingKey {
+        VerifyingKey::from_affine(self.0.public_key().to_affine()).unwrap().into()
     }
 }
 
+#[derive(Clone, uniffi::Object)]
+pub struct Signature(pub k256::ecdsa::Signature);
+
+#[uniffi::export]
+impl Signature {
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
+        let inner = k256::ecdsa::Signature::from_bytes(bytes.into())
+            .map_err(|_| GeneralError::InvalidInput("Invalid Signature encoding".to_string()))?;
+        Ok(Self(inner))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes().to_vec()
+    }
+}
 
 /*****************************************************************************
  * Keys for signing messages.
@@ -151,15 +167,20 @@ pub struct NodeVerifyingKey {
     bytes: Box<[u8]>,
 }
 
-#[uniffi::export]
-impl NodeVerifyingKey {
-    #[uniffi::constructor]
-    pub fn from_sk(sk: &NodeSecretKey) -> Self {
-        let inner = VerifyingKey::from(&sk.inner);
+impl From<VerifyingKey> for NodeVerifyingKey {
+    fn from(inner: VerifyingKey) -> Self {
         Self {
             bytes: inner.to_encoded_point(true).as_bytes().to_vec().into_boxed_slice(),
             inner,
         }
+    }
+}
+
+#[uniffi::export]
+impl NodeVerifyingKey {
+    #[uniffi::constructor]
+    pub fn from_sk(sk: &NodeSecretKey) -> Self {
+        Self::from(VerifyingKey::from(&sk.inner))
     }
 
     #[uniffi::constructor]
@@ -171,6 +192,10 @@ impl NodeVerifyingKey {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         self.bytes.to_vec()
+    }
+
+    pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), GeneralError> {
+        self.inner.verify(msg, &sig.0).map_err(|e| GeneralError::SignatureError(e.to_string()))
     }
 }
 
@@ -332,8 +357,8 @@ mod tests {
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
 pub trait NetworkInterface: Send + Sync {
-    async fn send(&self, data: Vec<u8>) -> Result<(), NetworkError>;
-    async fn receive(&self) -> Result<Vec<u8>, NetworkError>;
+    async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError>;
+    async fn receive(&self) -> Result<Vec<u8>, GeneralError>;
 }
 
 // Helper class to test the network interface.
@@ -350,7 +375,7 @@ impl NetworkInterfaceTester {
         Self { interface }
     }
 
-    pub async fn test(&self) -> Result<(), NetworkError> {
+    pub async fn test(&self) -> Result<(), GeneralError> {
         let test_bytes = vec![0x01, 0x02, 0x03, 0x04];
         let rx = self.interface.receive();
         let tx = self.interface.send(test_bytes.clone());
@@ -358,21 +383,21 @@ impl NetworkInterfaceTester {
         tx_res?;
         let received = rx_res?;
         if test_bytes != received {
-            return Err(NetworkError::MessageSendError);
+            return Err(GeneralError::MessageSendError);
         }
         Ok(())
     }
 
-    pub async fn test_relay(&self, data: Vec<u8>) -> Result<(), NetworkError> {
+    pub async fn test_relay(&self, data: Vec<u8>) -> Result<(), GeneralError> {
         let mut r1 = create_network_relay(self.interface.clone());
         let mut r2 = create_network_relay(self.interface.clone());
         let tx = r1.send(data.clone());
         let rx = r2.next();
         let (tx_res, rx_res) = futures::join!(tx, rx);
         tx_res?;
-        let received = rx_res.ok_or(NetworkError::MessageSendError)?;
+        let received = rx_res.ok_or(GeneralError::MessageSendError)?;
         if data != received {
-            return Err(NetworkError::MessageSendError);
+            return Err(GeneralError::MessageSendError);
         }
         Ok(())
     }

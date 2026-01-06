@@ -12,7 +12,7 @@ use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 use sl_dkls23::keygen::run as keygen_run;
 use sl_dkls23::Relay;
 
-use crate::error::{GeneralError, KeygenError};
+use crate::error::GeneralError;
 use crate::types::*;
 
 #[derive(uniffi::Object)]
@@ -37,7 +37,7 @@ impl DKGNode {
         }
     }
 
-    pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, KeygenError> {
+    pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, GeneralError> {
         let party_vk = self.setup.party_vk.lock().unwrap().clone();
         let ranks = vec![0u8; party_vk.len()];
         // Have to clone the VK vector here or we'll lose it.
@@ -54,7 +54,7 @@ impl DKGNode {
         keygen_run(setup_msg, rng.gen(), relay)
             .await
             .map(|k| Keyshare(Arc::new(k)))
-            .map_err(KeygenError::from)
+            .map_err(GeneralError::from)
     }
 }
 
@@ -114,7 +114,7 @@ impl DKGNode {
         self.party_id
     }
     
-    pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, KeygenError> {
+    pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, GeneralError> {
         self.do_keygen_relay(create_network_relay(interface)).await
     }
 }
@@ -148,9 +148,9 @@ impl DKGRunner {
         self.rt.set(rt).expect("Runtime already initialized");
     }
 
-    pub async fn run(&self, node: &DKGNode) -> Result<Keyshare, KeygenError> {
+    pub async fn run(&self, node: &DKGNode) -> Result<Keyshare, GeneralError> {
         let Some(rt) = self.rt.get() else {
-            return Err(KeygenError::InvalidContext);
+            return Err(GeneralError::InvalidContext);
         };
 
         // Use block_on to execute the async operation *on* the DKGRunner's runtime
