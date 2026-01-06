@@ -173,6 +173,14 @@ impl SignNode {
         self.req.setup.num_parties()
     }
 
+    pub fn message(&self) -> Vec<u8> {
+        self.req.message.clone()
+    }
+
+    pub fn hash(&self) -> Vec<u8> {
+        self.req.hash.to_vec()
+    }
+
     pub async fn do_sign(&self, interface: Arc<dyn NetworkInterface>) -> Result<Signature, GeneralError> {
         self.do_sign_relay(create_network_relay(interface)).await
     }

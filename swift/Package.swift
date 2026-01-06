@@ -22,6 +22,10 @@ let package = Package(
             name: "dkg",
             targets: ["CLIKeyGen"]
         ),
+        .executable(
+            name: "sign",
+            targets: ["CLISign"]
+        ),
     ],
     dependencies: [
         .package(
@@ -45,6 +49,14 @@ let package = Package(
         ),
         .executableTarget(
             name: "CLIKeyGen",
+            dependencies: [
+                "CLICore",
+                "DKLSLib",
+                .product(name: "MQTTNIO", package: "mqtt-nio"),
+            ]
+        ),
+        .executableTarget(
+            name: "CLISign",
             dependencies: [
                 "CLICore",
                 "DKLSLib",

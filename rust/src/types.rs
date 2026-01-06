@@ -80,6 +80,7 @@ impl Keyshare {
     }
 }
 
+#[uniffi::export]
 impl Keyshare {
     pub fn vk(&self) -> NodeVerifyingKey {
         VerifyingKey::from_affine(self.0.public_key().to_affine()).unwrap().into()
