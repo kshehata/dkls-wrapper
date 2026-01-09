@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use futures::{Future, sink, Sink, SinkExt, Stream, StreamExt};
 use core::pin::Pin;
 use rand::{Rng, SeedableRng};
@@ -58,6 +58,10 @@ impl Into<sl_dkls23::InstanceId> for InstanceId {
     }
 }
 
+
+/*****************************************************************************
+ * Key shares
+ *****************************************************************************/
 #[derive(Clone, uniffi::Object)]
 pub struct Keyshare(pub Arc<sl_dkls23::keygen::Keyshare>);
 
@@ -237,9 +241,70 @@ impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
     }
 }
 
+impl Verifier<k256::ecdsa::Signature> for &NodeVerifyingKey {
+    fn verify(&self, msg: &[u8], signature: &k256::ecdsa::Signature) -> Result<(), signature::Error> {
+        self.inner.verify(msg, signature)
+    }
+}
+
+pub struct ArcVerifier<T>(pub Arc<T>);
+
+impl<T: Verifier<S>, S> Verifier<S> for ArcVerifier<T> {
+    fn verify(&self, msg: &[u8], signature: &S) -> Result<(), signature::Error> {
+        self.0.verify(msg, signature)
+    }
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for ArcVerifier<T> {
+    fn as_ref(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
 /*****************************************************************************
  * Messages
  *****************************************************************************/
+
+ /*
+#[derive(Serialize, Deserialize)]
+pub struct SignedMessage<'a> {
+    pub msg: &'a [u8],
+    pub sig: Signature,
+}
+
+pub fn sign_message<T: Serialize>(msg: &T, sk: &NodeSecretKey) -> Result<Vec<u8>, GeneralError> {
+    let msg = msg.to_bytes();
+    let sig = sk.try_sign(&msg).map_err(|e| GeneralError::SignatureError(e.to_string()))?;
+    Ok(postcard::to_allocvec(SignedMessage { msg, sig }).unwrap().to_bytes())
+}
+*/
+
+// impl SignedMessage {
+//     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
+//         postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+//     }
+
+//     pub fn to_bytes(&self) -> Vec<u8> {
+//         postcard::to_allocvec(self).unwrap()
+//     }
+// }
+
+// A device is just a friendly name and a key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, uniffi::Object)]
+pub struct DeviceInfo {
+    pub friendly_name: String,
+    pub vk: NodeVerifyingKey,
+}
+
+impl DeviceInfo {
+    pub fn new(friendly_name: String, vk: NodeVerifyingKey) -> Self {
+        Self { friendly_name, vk }
+    }
+
+    pub fn for_sk(friendly_name: String, sk: &NodeSecretKey) -> Self {
+        Self { friendly_name, vk: NodeVerifyingKey::from_sk(sk) }
+    }
+}
 
 // To set up any operation we need to know the verification keys of all parties
 // and determine an ordering for them. Basic idea is that new parties scan the
@@ -249,33 +314,32 @@ impl Verifier<k256::ecdsa::Signature> for NodeVerifyingKey {
 pub struct SetupMessage {
     pub instance: InstanceId,
     pub threshold: u8,
-    pub party_vk: Mutex<Vec<NodeVerifyingKey>>,
+    pub parties: Vec<DeviceInfo>,
+    pub party_id: u8,
+    pub num_parties: u8,
+    pub start: bool,
 }
 
 impl SetupMessage {
     // Update setup from a received message.
     // Checks that instance, threshold, and all previous keys are the same,
     // and adds new keys to the store.
-    pub fn update(&self, setup_msg: SetupMessage) -> Result<(), GeneralError> {
-        // Lock the vk vector for the entire function.
-        let mut old_party_vk = self.party_vk.lock().unwrap();
-        let new_party_vk = setup_msg.party_vk.into_inner().unwrap();
-
+    pub fn update(&mut self, setup_msg: SetupMessage) -> Result<(), GeneralError> {
         // Make sure setup is consistent.
         if setup_msg.instance != self.instance
             || setup_msg.threshold != self.threshold
-            || new_party_vk.len() < old_party_vk.len()
+            || setup_msg.parties.len() < self.parties.len()
         {
             return Err(GeneralError::InvalidSetupMessage);
         }
 
         // If any of the keys are different, reject the setup.
-        if old_party_vk.as_slice() != &new_party_vk[..old_party_vk.len()] {
+        if self.parties.as_slice() != &setup_msg.parties[..self.parties.len()] {
             return Err(GeneralError::InvalidSetupMessage);
         }
 
         // Replace the local vector with the one received.
-        *old_party_vk = new_party_vk;
+        self.parties = setup_msg.parties;
         Ok(())
     }
 
@@ -296,7 +360,7 @@ impl SetupMessage {
     }
 
     pub fn num_parties(&self) -> u8 {
-        self.party_vk.lock().unwrap().len() as u8
+        self.parties.len() as u8
     }
 }
 
@@ -306,12 +370,12 @@ mod tests {
 
     impl PartialEq for SetupMessage {
         fn eq(&self, other: &Self) -> bool {
-            // Note: .lock().unwrap() may panic if the mutex is poisoned
-            let self_val = self.party_vk.lock().unwrap();
-            let other_val = other.party_vk.lock().unwrap();
             self.instance == other.instance
                 && self.threshold == other.threshold
-                && self_val.as_slice() == other_val.as_slice()
+                && self.parties.as_slice() == other.parties.as_slice()
+                && self.party_id == other.party_id
+                && self.num_parties == other.num_parties
+                && self.start == other.start
         }
     }
 
@@ -323,11 +387,14 @@ mod tests {
             NodeSecretKey::from_entropy(),
             NodeSecretKey::from_entropy(),
         ];
-        let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
+        let parties: Vec<DeviceInfo> = secret_keys.iter().enumerate().map(|(i, sk)| DeviceInfo::for_sk(format!("node{}", i), sk)).collect();
         let setup_msg = SetupMessage {
             instance,
             threshold: 2,
-            party_vk: Mutex::new(party_vk),
+            parties,
+            party_id: 0,
+            num_parties: 3,
+            start: false,
         };
         let serialized = setup_msg.to_string();
         let deserialized: SetupMessage = SetupMessage::from_string(&serialized).unwrap();
@@ -342,11 +409,14 @@ mod tests {
             NodeSecretKey::from_entropy(),
             NodeSecretKey::from_entropy(),
         ];
-        let party_vk: Vec<NodeVerifyingKey> = secret_keys.iter().map(|sk| NodeVerifyingKey::from_sk(sk)).collect();
+        let parties: Vec<DeviceInfo> = secret_keys.iter().enumerate().map(|(i, sk)| DeviceInfo::for_sk(format!("node{}", i), sk)).collect();
         let setup_msg = SetupMessage {
             instance,
             threshold: 2,
-            party_vk: Mutex::new(party_vk),
+            parties,
+            party_id: 0,
+            num_parties: 3,
+            start: false,
         };
         let serialized = setup_msg.to_bytes();
         let deserialized: SetupMessage = SetupMessage::from_bytes(&serialized).unwrap();

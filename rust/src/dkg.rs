@@ -11,49 +11,59 @@ use std::sync::OnceLock;
 use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 use sl_dkls23::keygen::run as keygen_run;
 use sl_dkls23::Relay;
+use sl_dkls23::setup::ArcSigner;
 
 use crate::error::GeneralError;
 use crate::types::*;
 
 #[derive(uniffi::Object)]
 pub struct DKGNode {
-    pub setup: SetupMessage,
-    pub party_id: u8,
+    pub setup: Mutex<SetupMessage>,
     pub secret_key: NodeSecretKey,
 }
 
 impl DKGNode {
-    pub fn from_setup(setup_msg: SetupMessage) -> Self {
-        let mut party_vk = setup_msg.party_vk.lock().unwrap();
-        let my_id = party_vk.len() as u8;
+    pub fn from_setup(mut setup_msg: SetupMessage, name: &str) -> Self {
+        setup_msg.party_id = setup_msg.parties.len() as u8;
         let secret_key = NodeSecretKey::from_entropy();
-        party_vk.push(NodeVerifyingKey::from_sk(&secret_key));
-        // drop the lock
-        drop(party_vk);
+        setup_msg.parties.push(DeviceInfo::for_sk(name.to_string(), &secret_key));
+        setup_msg.num_parties = setup_msg.parties.len() as u8;
         Self {
-            setup: setup_msg,
-            party_id: my_id,
+            setup: Mutex::new(setup_msg),
             secret_key,
         }
     }
 
     pub async fn do_keygen_relay<R: Relay>(&self, relay: R) -> Result<Keyshare, GeneralError> {
-        let party_vk = self.setup.party_vk.lock().unwrap().clone();
-        let ranks = vec![0u8; party_vk.len()];
-        // Have to clone the VK vector here or we'll lose it.
+        let (instance, party_id, threshold, parties) = {
+            let mut setup = self.setup.lock().unwrap();
+            (
+                setup.instance,
+                setup.party_id,
+                setup.threshold,
+                std::mem::take(&mut setup.parties),
+            )
+        };
+
+        let vkrefs: Vec<&NodeVerifyingKey> = parties.iter().map(|dev| &dev.vk).collect();
+        let ranks = vec![0u8; parties.len()];
         let setup_msg = KeygenSetup::new(
-            self.setup.instance.into(),
+            instance.into(),
             &self.secret_key,
-            self.party_id.into(),
-            party_vk,
+            party_id.into(),
+            vkrefs,
             &ranks,
-            self.setup.threshold.into()
+            threshold.into()
         );
+
         let mut rng = ChaCha20Rng::from_entropy();
 
-        keygen_run(setup_msg, rng.gen(), relay)
-            .await
-            .map(|k| Keyshare(Arc::new(k)))
+        let res = keygen_run(setup_msg, rng.gen(), relay).await;
+
+        // Restore the parties to the setup member
+        self.setup.lock().unwrap().parties = parties;
+
+        res.map(|k| Keyshare(Arc::new(k)))
             .map_err(GeneralError::from)
     }
 }
@@ -62,56 +72,58 @@ impl DKGNode {
 #[uniffi::export]
 impl DKGNode {
     #[uniffi::constructor]
-    pub fn starter(instance: &InstanceId, threshold: u8) -> Self {
+    pub fn starter(instance: &InstanceId, threshold: u8, name: &str) -> Self {
         let secret_key = NodeSecretKey::from_entropy();
-        let party_vk = vec![NodeVerifyingKey::from_sk(&secret_key)];
+        let parties = vec![DeviceInfo::for_sk(name.to_string(), &secret_key)];
         Self {
-            setup: SetupMessage {
+            setup: Mutex::new(SetupMessage {
                 instance: *instance,
                 threshold,
-                party_vk: Mutex::new(party_vk),
-            },
-            party_id: 0,
+                parties,
+                party_id: 0,
+                num_parties: 1,
+                start: false,
+            }),
             secret_key, 
         }
     }
 
     #[uniffi::constructor]
-    pub fn from_setup_string(setup_str: &String) -> Result<Self, GeneralError> {
-        Ok(DKGNode::from_setup(SetupMessage::from_string(setup_str)?))
+    pub fn from_setup_string(setup_str: &String, name: &str) -> Result<Self, GeneralError> {
+        Ok(DKGNode::from_setup(SetupMessage::from_string(setup_str)?, name))
     }
 
     #[uniffi::constructor]
-    pub fn from_setup_bytes(setup: &Vec<u8>) -> Result<Self, GeneralError> {
-        Ok(DKGNode::from_setup(SetupMessage::from_bytes(setup)?))
+    pub fn from_setup_bytes(setup: &Vec<u8>, name: &str) -> Result<Self, GeneralError> {
+        Ok(DKGNode::from_setup(SetupMessage::from_bytes(setup)?, name))
     }
 
     pub fn setup_string(&self) -> String {
-        self.setup.to_string()
+        self.setup.lock().unwrap().to_string()
     }
 
     pub fn setup_bytes(&self) -> Vec<u8> {
-        self.setup.to_bytes()
+        self.setup.lock().unwrap().to_bytes()
     }
 
     pub fn update_from_string(&self, setup: &String) -> Result<(), GeneralError> {
-        self.setup.update(SetupMessage::from_string(setup)?)
+        self.setup.lock().unwrap().update(SetupMessage::from_string(setup)?)
     }
 
     pub fn update_from_bytes(&self, setup: &Vec<u8>) -> Result<(), GeneralError> {
-        self.setup.update(SetupMessage::from_bytes(setup)?)
+        self.setup.lock().unwrap().update(SetupMessage::from_bytes(setup)?)
     }
 
     pub fn instance_id(&self) -> InstanceId {
-        self.setup.instance
+        self.setup.lock().unwrap().instance
     }
 
     pub fn threshold(&self) -> u8 {
-        self.setup.threshold
+        self.setup.lock().unwrap().threshold
     }
 
     pub fn party_id(&self) -> u8 {
-        self.party_id
+        self.setup.lock().unwrap().party_id
     }
     
     pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, GeneralError> {
@@ -172,10 +184,10 @@ mod tests {
     async fn test_dkg_node() {
         println!("Starting test");
         let instance = InstanceId::from_entropy();
-        let mut nodes = vec![DKGNode::starter(&instance, 2)];
+        let mut nodes = vec![DKGNode::starter(&instance, 2, "node0")];
         for i in 1..3 {
             println!("Adding node {}", i);
-            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes()).unwrap());
+            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes(), &format!("node{}", i)).unwrap());
             let new_setup = nodes[i].setup_bytes();
             for j in 0..i {
                 nodes[j].update_from_bytes(&new_setup).unwrap();

@@ -196,10 +196,10 @@ mod tests {
     async fn gen_key_shares() -> (Vec<NodeVerifyingKey>, Vec<NodeSecretKey>, Vec<Arc<Keyshare>>) {
         println!("Starting DKG");
         let instance = InstanceId::from_entropy();
-        let mut nodes = vec![DKGNode::starter(&instance, 2)];
+        let mut nodes = vec![DKGNode::starter(&instance, 2, "node0")];
         for i in 1..3 {
             println!("Adding node {}", i);
-            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes()).unwrap());
+            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes(), &format!("node{}", i)).unwrap());
             let new_setup = nodes[i].setup_bytes();
             for j in 0..i {
                 nodes[j].update_from_bytes(&new_setup).unwrap();
@@ -207,7 +207,7 @@ mod tests {
         }
 
         // backup the keys
-        let vks = nodes[0].setup.party_vk.lock().unwrap().clone();
+        let vks = nodes[0].setup.lock().unwrap().parties.iter().map(|p| p.vk.clone()).collect::<Vec<_>>();
         let sks = nodes.iter().map(|n| n.secret_key.clone()).collect::<Vec<_>>();
 
         // Simulate running each independently
