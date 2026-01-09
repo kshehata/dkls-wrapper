@@ -78,6 +78,11 @@ impl Keyshare {
         println!("PK={} SK={}", hex::encode(self.0.public_key().to_bytes()),
             hex::encode(self.0.s_i().to_bytes()));
     }
+
+    pub fn keyshare_string(&self) -> String {
+        format!("PK={} SK={}", hex::encode(self.0.public_key().to_bytes()),
+            hex::encode(self.0.s_i().to_bytes()))
+    }
 }
 
 #[uniffi::export]
@@ -351,6 +356,19 @@ mod tests {
         let serialized = setup_msg.to_bytes();
         let deserialized: SetupMessage = SetupMessage::from_bytes(&serialized).unwrap();
         assert_eq!(setup_msg, deserialized);
+    }
+}
+
+#[uniffi::export]
+impl NodeVerifyingKey {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.as_ref().to_vec()
+    }
+
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
+        let novk = sl_dkls23::setup::NoVerifyingKey::from(bytes);
+        Ok(Self(novk))
     }
 }
 
