@@ -294,15 +294,18 @@ pub fn sign_message<T: Serialize>(msg: &T, sk: &NodeSecretKey) -> Result<Vec<u8>
 pub struct DeviceInfo {
     pub friendly_name: String,
     pub vk: NodeVerifyingKey,
+    // Verified field is never serialized.
+    #[serde(skip, default)]
+    pub verified: bool,
 }
 
 impl DeviceInfo {
     pub fn new(friendly_name: String, vk: NodeVerifyingKey) -> Self {
-        Self { friendly_name, vk }
+        Self { friendly_name, vk, verified: false }
     }
 
     pub fn for_sk(friendly_name: String, sk: &NodeSecretKey) -> Self {
-        Self { friendly_name, vk: NodeVerifyingKey::from_sk(sk) }
+        Self { friendly_name, vk: NodeVerifyingKey::from_sk(sk), verified: false }
     }
 }
 

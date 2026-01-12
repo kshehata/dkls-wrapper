@@ -36,3 +36,6 @@ postcard = { version = "1.1.1", features = ["alloc"] }
 
 [build-dependencies]
 uniffi = { version = "0.30.0", features = [ "build" ] }
+
+[dev-dependencies]
+mockall = "0.14.0"

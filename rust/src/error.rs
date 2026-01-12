@@ -6,6 +6,8 @@ use sl_dkls23::sign::SignError as DklsSignError;
 pub enum GeneralError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
     #[error("Invalid signature: {0}")]
     SignatureError(String),
     #[error("Invalid setup message")]
