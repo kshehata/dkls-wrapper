@@ -1,4 +1,3 @@
-
 use std::sync::{Arc, Mutex};
 
 use rand::{Rng, SeedableRng};
@@ -8,12 +7,13 @@ use tokio::runtime::Runtime;
 
 use std::sync::OnceLock;
 
-use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 use sl_dkls23::keygen::run as keygen_run;
-use sl_dkls23::Relay;
+use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 use sl_dkls23::setup::ArcSigner;
+use sl_dkls23::Relay;
 
 use crate::error::GeneralError;
+use crate::net::{create_network_relay, NetworkInterface};
 use crate::types::*;
 
 #[derive(uniffi::Object)]
@@ -26,7 +26,9 @@ impl DKGNode {
     pub fn from_setup(mut setup_msg: SetupMessage, name: &str) -> Self {
         setup_msg.party_id = setup_msg.parties.len() as u8;
         let secret_key = NodeSecretKey::from_entropy();
-        setup_msg.parties.push(DeviceInfo::for_sk(name.to_string(), &secret_key));
+        setup_msg
+            .parties
+            .push(DeviceInfo::for_sk(name.to_string(), &secret_key));
         setup_msg.num_parties = setup_msg.parties.len() as u8;
         Self {
             setup: Mutex::new(setup_msg),
@@ -53,7 +55,7 @@ impl DKGNode {
             party_id.into(),
             vkrefs,
             &ranks,
-            threshold.into()
+            threshold.into(),
         );
 
         let mut rng = ChaCha20Rng::from_entropy();
@@ -67,7 +69,6 @@ impl DKGNode {
             .map_err(GeneralError::from)
     }
 }
-
 
 #[uniffi::export]
 impl DKGNode {
@@ -84,13 +85,16 @@ impl DKGNode {
                 num_parties: 1,
                 start: false,
             }),
-            secret_key, 
+            secret_key,
         }
     }
 
     #[uniffi::constructor]
     pub fn from_setup_string(setup_str: &String, name: &str) -> Result<Self, GeneralError> {
-        Ok(DKGNode::from_setup(SetupMessage::from_string(setup_str)?, name))
+        Ok(DKGNode::from_setup(
+            SetupMessage::from_string(setup_str)?,
+            name,
+        ))
     }
 
     #[uniffi::constructor]
@@ -107,11 +111,17 @@ impl DKGNode {
     }
 
     pub fn update_from_string(&self, setup: &String) -> Result<(), GeneralError> {
-        self.setup.lock().unwrap().update(SetupMessage::from_string(setup)?)
+        self.setup
+            .lock()
+            .unwrap()
+            .update(SetupMessage::from_string(setup)?)
     }
 
     pub fn update_from_bytes(&self, setup: &Vec<u8>) -> Result<(), GeneralError> {
-        self.setup.lock().unwrap().update(SetupMessage::from_bytes(setup)?)
+        self.setup
+            .lock()
+            .unwrap()
+            .update(SetupMessage::from_bytes(setup)?)
     }
 
     pub fn instance_id(&self) -> InstanceId {
@@ -125,8 +135,11 @@ impl DKGNode {
     pub fn party_id(&self) -> u8 {
         self.setup.lock().unwrap().party_id
     }
-    
-    pub async fn do_keygen(&self, interface: Arc<dyn NetworkInterface>) -> Result<Keyshare, GeneralError> {
+
+    pub async fn do_keygen(
+        &self,
+        interface: Arc<dyn NetworkInterface>,
+    ) -> Result<Keyshare, GeneralError> {
         self.do_keygen_relay(create_network_relay(interface)).await
     }
 }
@@ -155,7 +168,7 @@ impl DKGRunner {
             .enable_all()
             .build()
             .expect("Failed to create Tokio runtime");
-        
+
         // Store the runtime in the OnceLock for later access
         self.rt.set(rt).expect("Runtime already initialized");
     }
@@ -170,7 +183,7 @@ impl DKGRunner {
             // The async block *itself* now runs under the context of 'rt'
             node.do_keygen_relay(self.coord.connect()).await
         });
-        
+
         result
     }
 }
@@ -187,7 +200,10 @@ mod tests {
         let mut nodes = vec![DKGNode::starter(&instance, 2, "node0")];
         for i in 1..3 {
             println!("Adding node {}", i);
-            nodes.push(DKGNode::from_setup_bytes(&nodes[i-1].setup_bytes(), &format!("node{}", i)).unwrap());
+            nodes.push(
+                DKGNode::from_setup_bytes(&nodes[i - 1].setup_bytes(), &format!("node{}", i))
+                    .unwrap(),
+            );
             let new_setup = nodes[i].setup_bytes();
             for j in 0..i {
                 nodes[j].update_from_bytes(&new_setup).unwrap();
@@ -200,9 +216,7 @@ mod tests {
 
         for node in nodes {
             let relay = coord.connect();
-            parties.spawn(async move {
-                node.do_keygen_relay(relay).await
-            });
+            parties.spawn(async move { node.do_keygen_relay(relay).await });
         }
 
         // collect all of the shares
@@ -215,14 +229,18 @@ mod tests {
                     Err(err) => panic!("err {:?}", err),
                     Ok(share) => {
                         // println!("share {}", hex::encode(share.0.s_i().to_bytes()));
-                        shares.push(Arc::new(share)) },
+                        shares.push(Arc::new(share))
+                    }
                 }
             }
         }
 
         for keyshare in shares.iter() {
-            println!("PK={} SK={}", hex::encode(keyshare.0.public_key().to_bytes()),
-                hex::encode(keyshare.0.s_i().to_bytes()));
+            println!(
+                "PK={} SK={}",
+                hex::encode(keyshare.0.public_key().to_bytes()),
+                hex::encode(keyshare.0.s_i().to_bytes())
+            );
         }
     }
 }

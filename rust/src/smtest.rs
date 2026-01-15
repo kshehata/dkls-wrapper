@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use crate::error::GeneralError;
+use crate::net::{create_network_relay, NetworkInterface};
 use crate::types::*;
 
 #[cfg(test)]
@@ -395,7 +396,7 @@ impl DKGInternalState for DKGRunningState {
     fn receive_setup_msg(
         self: Box<Self>,
         _context: &DKGContext,
-        mut setup_msg: DKGSetupMessage,
+        _setup_msg: DKGSetupMessage,
     ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
