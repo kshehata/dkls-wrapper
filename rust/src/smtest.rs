@@ -6,6 +6,7 @@ use sl_dkls23::Relay as NetworkRelay;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 
 use crate::error::GeneralError;
 use crate::net::{create_network_relay, NetworkInterface};
@@ -138,9 +139,9 @@ trait DKGInternalState: Send + Sync + 'static {
         ))
     }
 
-    fn get_setup(&self) -> Result<&DKGSetupMessage, GeneralError> {
+    fn get_setup(&self) -> Result<Arc<DKGSetupMessage>, GeneralError> {
         Err(GeneralError::InvalidState(
-            "Cannot get setup in current state.".to_string(),
+            "Cannot get setup handle in current state.".to_string(),
         ))
     }
 
@@ -159,12 +160,6 @@ trait DKGInternalState: Send + Sync + 'static {
     fn start_dkg(
         self: Box<Self>,
         context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>);
-
-    fn finish_dkg(
-        self: Box<Self>,
-        context: &DKGContext,
-        result: Result<Keyshare, GeneralError>,
     ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>);
 
     fn get_result(&self) -> Result<Keyshare, GeneralError> {
@@ -233,19 +228,6 @@ impl DKGInternalState for DKGWaitForNetState {
             )),
         )
     }
-
-    fn finish_dkg(
-        self: Box<Self>,
-        _context: &DKGContext,
-        _result: Result<Keyshare, GeneralError>,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState(
-                "Cannot finish from current state.".to_string(),
-            )),
-        )
-    }
 }
 
 /*****************************************************************************
@@ -255,12 +237,14 @@ impl DKGInternalState for DKGWaitForNetState {
  *****************************************************************************/
 
 struct DKGReadyState {
-    setup: DKGSetupMessage,
+    setup: Arc<DKGSetupMessage>,
 }
 
 impl DKGReadyState {
     fn new(setup: DKGSetupMessage) -> Box<Self> {
-        Box::new(Self { setup })
+        Box::new(Self {
+            setup: Arc::new(setup),
+        })
     }
 }
 
@@ -281,19 +265,20 @@ impl DKGInternalState for DKGReadyState {
         })
     }
 
-    fn get_setup(&self) -> Result<&DKGSetupMessage, GeneralError> {
-        Ok(&self.setup)
+    fn get_setup(&self) -> Result<Arc<DKGSetupMessage>, GeneralError> {
+        Ok(self.setup.clone())
     }
 
     fn scan_qr(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _: &DKGContext,
         qr_data: QRData,
     ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        let mut setup = self.setup;
-        let res = setup.verify_qr(&qr_data).map(|_| ());
+        let res = Arc::make_mut(&mut self.setup)
+            .verify_qr(&qr_data)
+            .map(|_| ());
 
-        (Self::new(setup), res)
+        (self, res)
     }
 
     fn receive_setup_msg(
@@ -304,6 +289,7 @@ impl DKGInternalState for DKGReadyState {
         if let Err(e) = setup_msg.verify_existing(&self.setup) {
             return (self, Err(e));
         }
+        setup_msg.party_id = self.setup.party_id;
 
         // Check if we got the start flag, and if so
         // check that we have enough parties to start.
@@ -335,23 +321,10 @@ impl DKGInternalState for DKGReadyState {
                 )),
             )
         } else {
-            let mut setup = self.setup;
+            let mut setup = Arc::unwrap_or_clone(self.setup);
             setup.start = true;
             (DKGRunningState::new(setup), Ok(()))
         }
-    }
-
-    fn finish_dkg(
-        self: Box<Self>,
-        _context: &DKGContext,
-        _result: Result<Keyshare, GeneralError>,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState(
-                "Cannot finish from current state.".to_string(),
-            )),
-        )
     }
 }
 
@@ -361,12 +334,14 @@ impl DKGInternalState for DKGReadyState {
  *****************************************************************************/
 
 struct DKGRunningState {
-    setup: DKGSetupMessage,
+    setup: Arc<DKGSetupMessage>,
 }
 
 impl DKGRunningState {
     fn new(setup: DKGSetupMessage) -> Box<Self> {
-        Box::new(Self { setup })
+        Box::new(Self {
+            setup: Arc::new(setup),
+        })
     }
 }
 
@@ -375,9 +350,8 @@ impl DKGInternalState for DKGRunningState {
         DKGState::Running
     }
 
-    // This should only be used for testing!
-    fn get_setup(&self) -> Result<&DKGSetupMessage, GeneralError> {
-        Ok(&self.setup)
+    fn get_setup(&self) -> Result<Arc<DKGSetupMessage>, GeneralError> {
+        Ok(self.setup.clone())
     }
 
     fn scan_qr(
@@ -417,14 +391,6 @@ impl DKGInternalState for DKGRunningState {
             )),
         )
     }
-
-    fn finish_dkg(
-        self: Box<Self>,
-        _context: &DKGContext,
-        result: Result<Keyshare, GeneralError>,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (DKGFinishedState::new(self.setup, result), Ok(()))
-    }
 }
 
 /*****************************************************************************
@@ -433,12 +399,12 @@ impl DKGInternalState for DKGRunningState {
  *****************************************************************************/
 
 struct DKGFinishedState {
-    setup: DKGSetupMessage,
+    setup: Arc<DKGSetupMessage>,
     result: Result<Keyshare, GeneralError>,
 }
 
 impl DKGFinishedState {
-    fn new(setup: DKGSetupMessage, result: Result<Keyshare, GeneralError>) -> Box<Self> {
+    fn new(setup: Arc<DKGSetupMessage>, result: Result<Keyshare, GeneralError>) -> Box<Self> {
         Box::new(Self { setup, result })
     }
 }
@@ -456,8 +422,8 @@ impl DKGInternalState for DKGFinishedState {
         })
     }
 
-    fn get_setup(&self) -> Result<&DKGSetupMessage, GeneralError> {
-        Ok(&self.setup)
+    fn get_setup(&self) -> Result<Arc<DKGSetupMessage>, GeneralError> {
+        Ok(self.setup.clone())
     }
 
     fn receive_setup_msg(
@@ -498,17 +464,6 @@ impl DKGInternalState for DKGFinishedState {
         )
     }
 
-    fn finish_dkg(
-        self: Box<Self>,
-        _context: &DKGContext,
-        _result: Result<Keyshare, GeneralError>,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState("Already finished.".to_string())),
-        )
-    }
-
     fn get_result(&self) -> Result<Keyshare, GeneralError> {
         self.result.clone()
     }
@@ -526,6 +481,7 @@ pub struct DKGNode {
     context: DKGContext,
     setup_if: Arc<dyn NetworkInterface>,
     dkg_if: Arc<dyn NetworkInterface>,
+    await_msg_kick: Notify,
 }
 
 impl DKGNode {
@@ -552,6 +508,7 @@ impl DKGNode {
             context,
             setup_if,
             dkg_if,
+            await_msg_kick: Notify::new(),
         }
     }
 
@@ -570,6 +527,7 @@ impl DKGNode {
             context,
             setup_if,
             dkg_if,
+            await_msg_kick: Notify::new(),
         }
     }
 
@@ -594,13 +552,21 @@ impl DKGNode {
     }
 
     // Shortcut to receive and parse a setup message.
-    async fn get_next_setup_msg(&self) -> Result<DKGSetupMessage, GeneralError> {
-        let data = self.setup_if.receive().await?;
+    async fn get_next_msg_interruptable(&self) -> Result<DKGSetupMessage, GeneralError> {
+        let receive_fut = self.setup_if.receive();
+        let stop_fut = self.await_msg_kick.notified();
+
+        let data = tokio::select! {
+            res = receive_fut => res?,
+            _ = stop_fut => return Err(GeneralError::Cancelled),
+        };
         DKGSetupMessage::try_from(data.as_slice())
     }
 
     async fn process_next_setup_msg(&self) -> Result<(), GeneralError> {
-        let setup_msg = self.get_next_setup_msg().await?;
+        println!("{:?} Waiting for setup message", self.context.friendly_name);
+        let setup_msg = self.get_next_msg_interruptable().await?;
+        println!("{:?} Received setup message", self.context.friendly_name);
         let bytes_to_send = self.receive_setup_msg_internal(setup_msg)?;
         if !bytes_to_send.is_empty() {
             self.setup_if.send(bytes_to_send).await?;
@@ -632,74 +598,100 @@ impl DKGNode {
             *guard = Some(new_state);
             return Err(e);
         }
-        // Have to send the start message out to the other nodes.
-        if let Err(e) = self
-            .dkg_if
-            .send(new_state.get_setup().unwrap().to_bytes())
-            .await
-        {
-            *guard = Some(new_state);
-            return Err(e);
-        }
-        let (new_state, res) = self.do_dkg_internal(new_state).await;
+        let bytes_to_send = new_state.get_setup().unwrap().to_bytes();
         *guard = Some(new_state);
-        res
+        drop(guard);
+        if !bytes_to_send.is_empty() {
+            println!("{:?} Sending start message", self.context.friendly_name);
+            self.dkg_if.send(bytes_to_send).await?;
+        }
+        println!("{:?} Notifying waiters", self.context.friendly_name);
+        self.await_msg_kick.notify_waiters();
+        Ok(())
+        // let (new_state, res) = self.do_dkg_internal(new_state).await;
+        // *guard = Some(new_state);
+        // res
     }
 
-    async fn do_dkg_internal(
-        &self,
-        state: Box<dyn DKGInternalState>,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        if state.get_state() != DKGState::Running {
-            return (
-                state,
-                Err(GeneralError::InvalidState(
-                    "Cannot run DKG in other than running state.".to_string(),
-                )),
-            );
-        }
-        let setup = state.get_setup().unwrap();
-        let result = do_keygen_relay(
-            &setup,
+    async fn do_dkg_internal(&self, setup: Arc<DKGSetupMessage>) -> Result<Keyshare, GeneralError> {
+        // TODO: should maybe put a Mutex here to make sure it never runs twice?
+
+        let vkrefs: Vec<&NodeVerifyingKey> = setup.parties.iter().map(|dev| &dev.vk).collect();
+        let ranks = vec![0u8; setup.parties.len()];
+        let setup_msg = KeygenSetup::new(
+            setup.instance.into(),
             &self.context.sk,
+            setup.party_id.into(),
+            vkrefs,
+            &ranks,
+            setup.threshold.into(),
+        );
+
+        let mut rng = ChaCha20Rng::from_entropy();
+
+        println!("{:?} keygen_run", self.context.friendly_name);
+        let result = keygen_run(
+            setup_msg,
+            rng.gen(),
             create_network_relay(self.dkg_if.clone()),
         )
-        .await;
-        let local_result = result.clone().map(|_| ());
-        let (new_state, res) = state.finish_dkg(&self.context, result);
-        // This should *always* be Ok(()), but better to be safe ?
-        match res {
-            Ok(_) => (new_state, local_result),
-            Err(e) => (new_state, Err(e)),
-        }
+        .await
+        .map(|k| Keyshare(Arc::new(k)))
+        .map_err(GeneralError::from);
+        println!("{:?} keygen_run done", self.context.friendly_name);
+
+        result
     }
 
     pub async fn message_loop(&self) -> Result<(), GeneralError> {
         // HACK: Need to send the initial setup message if we're the first one.
-        if self.get_state() == DKGState::Ready {
-            self.setup_if
-                .send(
-                    self.state
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .get_setup()
-                        .unwrap()
-                        .to_bytes(),
-                )
-                .await?;
+
+        println!(
+            "{:?} Message loop start in state {:?}",
+            self.context.friendly_name,
+            self.get_state()
+        );
+        if self.get_state() == DKGState::WaitForParties {
+            println!("{:?} Sending setup message", self.context.friendly_name);
+            let setup_bytes = self
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_setup()
+                .unwrap()
+                .to_bytes();
+            self.setup_if.send(setup_bytes).await?;
         }
 
         while self.get_state() != DKGState::Running {
-            self.process_next_setup_msg().await?;
+            // If message received cancelled then fall through.
+            match self.process_next_setup_msg().await {
+                Err(GeneralError::Cancelled) => break,
+                res => res?,
+            }
         }
         // Start the actual DKG
+        let setup = {
+            let guard = self.state.read().unwrap();
+            let state = guard.as_ref().unwrap();
+            if state.get_state() != DKGState::Running {
+                println!("{:?} Not Running!?!", self.context.friendly_name);
+                return Err(GeneralError::InvalidState(
+                    "Calculated state is running but stored state is not?".to_string(),
+                ));
+            }
+            state.get_setup().unwrap()
+        };
+
+        println!("{:?} Starting DKG", self.context.friendly_name);
+        let res = self.do_dkg_internal(setup.clone()).await;
+        println!("{:?} DKG Complete?", self.context.friendly_name);
+
         let mut guard = self.state.write().unwrap();
-        let current_state = guard.take().unwrap();
-        let (new_state, res) = self.do_dkg_internal(current_state).await;
-        *guard = Some(new_state);
-        res
+        *guard = Some(DKGFinishedState::new(setup, res));
+        Ok(())
     }
 }
 
@@ -708,7 +700,7 @@ impl DKGNode {
  *****************************************************************************/
 
 pub async fn do_keygen_relay<R: NetworkRelay>(
-    setup: &DKGSetupMessage,
+    setup: Arc<DKGSetupMessage>,
     sk: &NodeSecretKey,
     relay: R,
 ) -> Result<Keyshare, GeneralError> {
@@ -730,4 +722,213 @@ pub async fn do_keygen_relay<R: NetworkRelay>(
     result
         .map(|k| Keyshare(Arc::new(k)))
         .map_err(GeneralError::from)
+}
+
+/*****************************************************************************
+ * Tests
+ *****************************************************************************/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::InMemoryBridge;
+    use k256::elliptic_curve::group::GroupEncoding;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dkg_from_setup_relay() {
+        let instance = InstanceId::from_entropy();
+        let sks = (0..3)
+            .map(|_| NodeSecretKey::from_entropy())
+            .collect::<Vec<_>>();
+        let devs = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| DeviceInfo::for_sk(format!("Node{}", i), sk))
+            .collect::<Vec<_>>();
+
+        let setup_msgs = devs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                Arc::new(DKGSetupMessage {
+                    instance,
+                    party_id: i as u8,
+                    threshold: 2,
+                    parties: devs.clone(),
+                    start: true,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut parties = tokio::task::JoinSet::new();
+        let coord = sl_mpc_mate::coord::SimpleMessageRelay::new();
+
+        for (sk, setup) in sks.into_iter().zip(setup_msgs.into_iter()) {
+            let relay = coord.connect();
+            parties.spawn(async move { do_keygen_relay(setup, &sk, relay).await });
+        }
+
+        // collect all of the shares
+        let mut shares = vec![];
+        while let Some(fini) = parties.join_next().await {
+            if let Err(ref err) = fini {
+                println!("error {err:?}");
+            } else {
+                match fini.unwrap() {
+                    Err(err) => panic!("err {:?}", err),
+                    Ok(share) => {
+                        // println!("share {}", hex::encode(share.0.s_i().to_bytes()));
+                        shares.push(Arc::new(share))
+                    }
+                }
+            }
+        }
+
+        for keyshare in shares.iter() {
+            println!(
+                "PK={} SK={}",
+                hex::encode(keyshare.0.public_key().to_bytes()),
+                hex::encode(keyshare.0.s_i().to_bytes())
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dkg_from_setup_ni() {
+        let instance = InstanceId::from_entropy();
+        let sks = (0..3)
+            .map(|_| NodeSecretKey::from_entropy())
+            .collect::<Vec<_>>();
+        let devs = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| DeviceInfo::for_sk(format!("Node{}", i), sk))
+            .collect::<Vec<_>>();
+
+        let setup_msgs = devs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                Arc::new(DKGSetupMessage {
+                    instance,
+                    party_id: i as u8,
+                    threshold: 2,
+                    parties: devs.clone(),
+                    start: true,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut parties = tokio::task::JoinSet::new();
+        let coord = InMemoryBridge::new();
+        let nis = setup_msgs
+            .iter()
+            .map(|_| coord.connect())
+            .collect::<Vec<_>>();
+
+        for ((sk, setup), ni) in sks
+            .into_iter()
+            .zip(setup_msgs.into_iter())
+            .zip(nis.into_iter())
+        {
+            parties.spawn(timeout(Duration::from_secs(5), async move {
+                do_keygen_relay(setup, &sk, create_network_relay(ni)).await
+            }));
+        }
+
+        // collect all of the shares
+        let mut shares = vec![];
+        while let Some(fini) = parties.join_next().await {
+            if let Err(ref err) = fini {
+                println!("error {err:?}");
+            } else {
+                match fini.unwrap() {
+                    Err(err) => panic!("err {:?}", err),
+                    Ok(share) => {
+                        // println!("share {}", hex::encode(share.0.s_i().to_bytes()));
+                        shares.push(Arc::new(share))
+                    }
+                }
+            }
+        }
+
+        // for keyshare in shares.iter() {
+        //     println!(
+        //         "PK={} SK={}",
+        //         hex::encode(keyshare.0.public_key().to_bytes()),
+        //         hex::encode(keyshare.0.s_i().to_bytes())
+        //     );
+        // }
+    }
+
+    fn spawn_node(
+        js: &mut tokio::task::JoinSet<()>,
+        node: Arc<DKGNode>,
+    ) -> tokio::task::AbortHandle {
+        js.spawn(async move {
+            let _ = node.message_loop().await;
+        })
+    }
+
+    async fn wait_for_state(node: Arc<DKGNode>, state: DKGState, iters: u64) -> bool {
+        for _ in 0..iters {
+            if node.get_state() == state {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dkg_node() {
+        println!("Starting DKG Node Test");
+        let instance = InstanceId::from_entropy();
+
+        let setup_coord = InMemoryBridge::new();
+        let dkg_coord = InMemoryBridge::new();
+
+        let mut nodes = vec![Arc::new(DKGNode::new(
+            "Node1",
+            instance,
+            2,
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        ))];
+
+        assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
+
+        let qr = nodes[0].get_qr().unwrap();
+        assert_eq!(qr.instance, instance);
+        assert_eq!(qr.party_id, 0);
+        // TODO: check vk
+
+        nodes.push(Arc::new(DKGNode::from_qr(
+            "Node2",
+            qr.clone(),
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        )));
+        assert_eq!(nodes[1].get_state(), DKGState::WaitForSetup);
+
+        let mut parties = tokio::task::JoinSet::new();
+        spawn_node(&mut parties, nodes[1].clone());
+        spawn_node(&mut parties, nodes[0].clone());
+
+        println!("Got this far");
+
+        // Wait for both nodes to become ready.
+        assert!(wait_for_state(nodes[1].clone(), DKGState::Ready, 50).await);
+        assert!(wait_for_state(nodes[0].clone(), DKGState::Ready, 50).await);
+
+        println!("Starting DKG");
+        assert!(nodes[0].start_dkg().await.is_ok());
+        assert!(nodes[1].start_dkg().await.is_ok());
+
+        // Wait for both nodes to finish DKG.
+        assert!(wait_for_state(nodes[1].clone(), DKGState::Finished, 500).await);
+        assert!(wait_for_state(nodes[0].clone(), DKGState::Finished, 500).await);
+    }
 }

@@ -26,6 +26,8 @@ pub enum GeneralError {
     InvalidContext,
     #[error("Internal failure")]
     Generic,
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 impl From<DklsKeygenError> for GeneralError {

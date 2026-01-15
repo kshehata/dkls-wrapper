@@ -163,18 +163,26 @@ pub fn create_network_relay(interface: Arc<dyn NetworkInterface>) -> impl sl_dkl
  *****************************************************************************/
 
 pub struct InMemoryBridge {
-    tx: broadcast::Sender<Vec<u8>>,
+    tx: broadcast::Sender<(usize, Vec<u8>)>,
+    next_id: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryBridge {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(100);
-        Self { tx }
+        Self {
+            tx,
+            next_id: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     pub fn connect(&self) -> Arc<dyn NetworkInterface> {
         let rx = self.tx.subscribe();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Arc::new(InMemoryNetworkInterface {
+            id,
             tx: self.tx.clone(),
             rx: Mutex::new(rx),
         })
@@ -182,15 +190,16 @@ impl InMemoryBridge {
 }
 
 struct InMemoryNetworkInterface {
-    tx: broadcast::Sender<Vec<u8>>,
-    rx: Mutex<broadcast::Receiver<Vec<u8>>>,
+    id: usize,
+    tx: broadcast::Sender<(usize, Vec<u8>)>,
+    rx: Mutex<broadcast::Receiver<(usize, Vec<u8>)>>,
 }
 
 #[async_trait::async_trait]
 impl NetworkInterface for InMemoryNetworkInterface {
     async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError> {
         self.tx
-            .send(data)
+            .send((self.id, data))
             .map_err(|_| GeneralError::MessageSendError)?;
         Ok(())
     }
@@ -199,7 +208,11 @@ impl NetworkInterface for InMemoryNetworkInterface {
         let mut rx = self.rx.lock().await;
         loop {
             match rx.recv().await {
-                Ok(data) => return Ok(data),
+                Ok((id, data)) => {
+                    if id != self.id {
+                        return Ok(data);
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(GeneralError::MessageSendError)
@@ -212,6 +225,7 @@ impl NetworkInterface for InMemoryNetworkInterface {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_in_memory_bridge_simple() {
@@ -226,9 +240,9 @@ mod bridge_tests {
         let recv_msg = net2.receive().await.unwrap();
         assert_eq!(msg, recv_msg);
 
-        // net1 should also receive it (loopback) because broadcast sends to all subscribers
-        let recv_msg_loopback = net1.receive().await.unwrap();
-        assert_eq!(msg, recv_msg_loopback);
+        // net1 should NOT receive it (loopback filtered)
+        let res = timeout(Duration::from_millis(100), net1.receive()).await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]
