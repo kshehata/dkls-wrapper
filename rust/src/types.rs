@@ -85,6 +85,10 @@ impl Keyshare {
             hex::encode(self.0.s_i().to_bytes())
         );
     }
+
+    pub fn threshold(&self) -> u8 {
+        self.0.threshold
+    }
 }
 
 #[uniffi::export]
@@ -339,131 +343,5 @@ impl DeviceInfo {
             vk: NodeVerifyingKey::from_sk(sk),
             verified: false,
         }
-    }
-}
-
-// To set up any operation we need to know the verification keys of all parties
-// and determine an ordering for them. Basic idea is that new parties scan the
-// QR code of an existing member, then send a network message to update
-// existing parties.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SetupMessage {
-    pub instance: InstanceId,
-    pub threshold: u8,
-    pub parties: Vec<DeviceInfo>,
-    pub party_id: u8,
-    pub num_parties: u8,
-    pub start: bool,
-}
-
-impl SetupMessage {
-    // Update setup from a received message.
-    // Checks that instance, threshold, and all previous keys are the same,
-    // and adds new keys to the store.
-    pub fn update(&mut self, setup_msg: SetupMessage) -> Result<(), GeneralError> {
-        // Make sure setup is consistent.
-        if setup_msg.instance != self.instance
-            || setup_msg.threshold != self.threshold
-            || setup_msg.parties.len() < self.parties.len()
-        {
-            return Err(GeneralError::InvalidSetupMessage);
-        }
-
-        // If any of the keys are different, reject the setup.
-        if self.parties.as_slice() != &setup_msg.parties[..self.parties.len()] {
-            return Err(GeneralError::InvalidSetupMessage);
-        }
-
-        // Replace the local vector with the one received.
-        self.parties = setup_msg.parties;
-        Ok(())
-    }
-
-    pub fn from_string(s: &String) -> Result<Self, GeneralError> {
-        serde_json::from_str(s).map_err(|e| GeneralError::InvalidInput(e.to_string()))
-    }
-
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-
-    pub fn from_bytes(bytes: &Vec<u8>) -> Result<Self, GeneralError> {
-        postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).unwrap()
-    }
-
-    pub fn num_parties(&self) -> u8 {
-        self.parties.len() as u8
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    impl PartialEq for SetupMessage {
-        fn eq(&self, other: &Self) -> bool {
-            self.instance == other.instance
-                && self.threshold == other.threshold
-                && self.parties.as_slice() == other.parties.as_slice()
-                && self.party_id == other.party_id
-                && self.num_parties == other.num_parties
-                && self.start == other.start
-        }
-    }
-
-    #[test]
-    fn test_dkg_setup_message() {
-        let instance = InstanceId::from_entropy();
-        let secret_keys = vec![
-            NodeSecretKey::from_entropy(),
-            NodeSecretKey::from_entropy(),
-            NodeSecretKey::from_entropy(),
-        ];
-        let parties: Vec<DeviceInfo> = secret_keys
-            .iter()
-            .enumerate()
-            .map(|(i, sk)| DeviceInfo::for_sk(format!("node{}", i), sk))
-            .collect();
-        let setup_msg = SetupMessage {
-            instance,
-            threshold: 2,
-            parties,
-            party_id: 0,
-            num_parties: 3,
-            start: false,
-        };
-        let serialized = setup_msg.to_string();
-        let deserialized: SetupMessage = SetupMessage::from_string(&serialized).unwrap();
-        assert_eq!(setup_msg, deserialized);
-    }
-
-    #[test]
-    fn test_dkg_setup_message_postcard() {
-        let instance = InstanceId::from_entropy();
-        let secret_keys = vec![
-            NodeSecretKey::from_entropy(),
-            NodeSecretKey::from_entropy(),
-            NodeSecretKey::from_entropy(),
-        ];
-        let parties: Vec<DeviceInfo> = secret_keys
-            .iter()
-            .enumerate()
-            .map(|(i, sk)| DeviceInfo::for_sk(format!("node{}", i), sk))
-            .collect();
-        let setup_msg = SetupMessage {
-            instance,
-            threshold: 2,
-            parties,
-            party_id: 0,
-            num_parties: 3,
-            start: false,
-        };
-        let serialized = setup_msg.to_bytes();
-        let deserialized: SetupMessage = SetupMessage::from_bytes(&serialized).unwrap();
-        assert_eq!(setup_msg, deserialized);
     }
 }
