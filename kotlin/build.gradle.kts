@@ -13,7 +13,10 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.12.0")  // JNA library (refer to `https://mozilla.github.io/uniffi-rs/latest/kotlin/gradle.html#jna-dependency`)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")  // Kotlin coroutines library (refer to `https://github.com/Kotlin/kotlinx.coroutines`)
     testImplementation(kotlin("test"))  // Kotlin's test library (refer to `https://kotlinlang.org/docs/gradle-configure-project.html#set-dependencies-on-test-libraries`)
-    //implementation("io.github.nur-shuvo:KMqttClient:1.0.0")  // KMqttClient library (refer to `https://github.com/nur-shuvo/KMqttClient`)
+
+    // KMqtt library (refer to `https://github.com/davidepianca98/KMQTT/tree/1.0.0`)
+    implementation("io.github.davidepianca98:kmqtt-common-jvm:1.0.0")
+    implementation("io.github.davidepianca98:kmqtt-client-jvm:1.0.0")
 }
 
 kotlin {
