@@ -1,0 +1,36 @@
+import org.gradle.api.tasks.JavaExec
+
+plugins {
+    kotlin("jvm") version "2.3.0"
+    application
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("net.java.dev.jna:jna:5.12.0")  // JNA library (refer to `https://mozilla.github.io/uniffi-rs/latest/kotlin/gradle.html#jna-dependency`)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")  // Kotlin coroutines library (refer to `https://github.com/Kotlin/kotlinx.coroutines`)
+    testImplementation(kotlin("test"))  // Kotlin's test library (refer to `https://kotlinlang.org/docs/gradle-configure-project.html#set-dependencies-on-test-libraries`)
+    //implementation("io.github.nur-shuvo:KMqttClient:1.0.0")  // KMqttClient library (refer to `https://github.com/nur-shuvo/KMqttClient`)
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+application {
+    mainClass.set("app.MainKt")  // Such that `app/Main.kt` contains `main()`
+}
+
+val nativeDir = layout.projectDirectory.dir("src/main/resources/native").asFile.absolutePath
+
+tasks.named<JavaExec>("run") {
+    systemProperty("java.library.path", nativeDir)
+    workingDir = project.projectDir  // Make runs consistent even if launched from elsewhere
+}
+
+tasks.test {
+    useJUnitPlatform()  // JUnitPlatform for tests. See `https://docs.gradle.org/current/javadoc/org/gradle/api/tasks/testing/Test.html#useJUnitPlatform`
+}
