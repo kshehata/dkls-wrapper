@@ -1,4 +1,6 @@
 .DS_Store
+src/main/java
+src/main/jniLibs
 src/main/kotlin/uniffi
 src/main/resources
 
