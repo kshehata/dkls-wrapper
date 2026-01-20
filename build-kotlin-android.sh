@@ -1,8 +1,5 @@
-#! /bin/bash
-
-set -e
-
-# TODO: pass these in from build env
+#!/bin/bash
+set -euo pipefail
 
 # Name of the Rust crate / resulting library (libdkls.so)
 PACKAGE=dkls
@@ -11,29 +8,22 @@ PACKAGE=dkls
 ANDROID_MODULE=kotlin
 
 # Where to put generated Kotlin sources
-KOTLIN_OUT_DIR=$ANDROID_MODULE/src/main/java
+KOTLIN_OUT_DIR="$ANDROID_MODULE/src/main/java"
 
 # Where to put Android .so libraries (per-ABI subdirs)
-JNILIBS_OUT_DIR=$ANDROID_MODULE/src/main/jniLibs
+JNILIBS_OUT_DIR="$ANDROID_MODULE/src/main/jniLibs"
 
-# Android Rust targets (for cargo-ndk)
-ANDROID_TARGETS=(
-  aarch64-linux-android    # arm64-v8a
-  armv7-linux-androideabi  # armeabi-v7a
-  x86_64-linux-android     # x86_64
-  i686-linux-android       # x86
-)
+# ABIs we build (must match the cargo-ndk -t args below)
+ANDROID_ABIS=(arm64-v8a armeabi-v7a x86_64 x86)
 
 echo "==> Ensuring Rust Android targets are installed"
-for t in "${ANDROID_TARGETS[@]}"; do
+RUST_TARGETS=(aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android)
+for t in "${RUST_TARGETS[@]}"; do
   rustup target add "$t"
 done
 
 echo "==> Building Rust library for Android with cargo-ndk"
 cd rust
-
-# Make sure cargo-ndk is installed:
-#   cargo install cargo-ndk
 cargo ndk \
   -t armeabi-v7a \
   -t arm64-v8a \
@@ -41,30 +31,34 @@ cargo ndk \
   -t x86_64 \
   -o "../$JNILIBS_OUT_DIR" \
   build --release
-
 cd ..
 
 echo "==> Cleaning old generated Kotlin bindings"
 rm -rf "$KOTLIN_OUT_DIR/uniffi" 2>/dev/null || true
 
-echo "==> Generating Kotlin bindings with uniffi-bindgen (proc-macro mode)"
-# We point uniffi-bindgen at one of the built Android libraries.
-# Any of the ABI .so files is fine; uniffi just needs metadata.
-LIB_PATH="../$JNILIBS_OUT_DIR/arm64-v8a/lib${PACKAGE}.so"
+echo "==> Locating an Android .so for bindgen metadata"
+LIB_PATH=""
+for abi in "${ANDROID_ABIS[@]}"; do
+  candidate="$JNILIBS_OUT_DIR/$abi/lib${PACKAGE}.so"
+  if [[ -f "$candidate" ]]; then
+    LIB_PATH="$candidate"
+    break
+  fi
+done
 
-# Make sure uniffi_bindgen is installed:
-#   cargo install uniffi
-#   uniffi-bindgen --version
-cd rust  # cd into `rust/` where Cargo.toml exists
+if [[ -z "$LIB_PATH" ]]; then
+  echo "ERROR: Could not find any built lib${PACKAGE}.so under $JNILIBS_OUT_DIR" >&2
+  exit 1
+fi
+
+echo "==> Generating Kotlin bindings with uniffi-bindgen"
+cd rust
 uniffi-bindgen generate \
-  --library "$LIB_PATH" \
+  --library "../$LIB_PATH" \
   --language kotlin \
   --out-dir "../$KOTLIN_OUT_DIR"
+cd ..
 
 echo "==> Done."
 echo "Kotlin bindings generated into: $KOTLIN_OUT_DIR"
 echo "Android .so libraries generated into: $JNILIBS_OUT_DIR"
-echo
-echo "Next steps:"
-echo "  - Add the $ANDROID_MODULE module as a dependency of your app."
-echo "  - Call System.loadLibrary(\"$PACKAGE\") before using the generated Kotlin classes."

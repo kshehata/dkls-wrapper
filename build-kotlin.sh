@@ -12,11 +12,29 @@ cd rust
 cargo build --release
 cd ..
 
+# Pick library name by platform
+UNAME="$(uname -s)"
+case "$UNAME" in
+  MINGW*|MSYS*|CYGWIN*)
+    LIB_FILE="${PACKAGE}.dll"
+    ;;
+  Darwin*)
+    LIB_FILE="lib${PACKAGE}.dylib"
+    ;;
+  Linux*)
+    LIB_FILE="lib${PACKAGE}.so"
+    ;;
+  *)
+    echo "Unsupported OS from uname: $UNAME" >&2
+    exit 1
+    ;;
+esac
+
 # You must point this to the actual produced file on your OS.
 # Common Linux output: rust/target/release/libdkls.so
-LIB_PATH="rust/target/release/lib${PACKAGE}.so"
+LIB_PATH="rust/target/release/$LIB_FILE"
 
-echo "==> Copying native library into Kotlin resources"
+echo "==> Copying native library into Kotlin resources: $LIB_PATH"
 mkdir -p "$NATIVE_OUT_DIR"
 cp -f "$LIB_PATH" "$NATIVE_OUT_DIR/"
 
@@ -33,4 +51,4 @@ cd ..
 
 echo "==> Done"
 echo "Kotlin bindings: $KOTLIN_OUT_DIR"
-echo "Native library:  $NATIVE_OUT_DIR"
+echo "Native library: $NATIVE_OUT_DIR/$LIB_FILE"
