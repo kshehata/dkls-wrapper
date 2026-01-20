@@ -1,4 +1,6 @@
 import org.gradle.api.tasks.JavaExec
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     kotlin("jvm") version "2.3.0"
@@ -20,7 +22,15 @@ dependencies {
 }
 
 kotlin {
+    // Baseline toolchain: compile using JDK 17
     jvmToolchain(17)
+}
+
+// Baseline bytecode: produce artifacts runnable on Java 17+
+tasks.withType<KotlinCompile>().configureEach {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
 }
 
 application {
