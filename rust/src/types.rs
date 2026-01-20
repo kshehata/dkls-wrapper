@@ -58,6 +58,12 @@ impl Into<sl_dkls23::InstanceId> for InstanceId {
     }
 }
 
+impl AsRef<[u8]> for InstanceId {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /*****************************************************************************
  * Key shares
  *****************************************************************************/
@@ -100,16 +106,43 @@ impl Keyshare {
     }
 }
 
-#[derive(Clone, uniffi::Object)]
+#[derive(Debug, Clone, uniffi::Object)]
 pub struct Signature(pub k256::ecdsa::Signature);
+
+impl TryFrom<&[u8]> for Signature {
+    type Error = GeneralError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let inner = k256::ecdsa::Signature::from_bytes(value.into())
+            .map_err(|_| GeneralError::InvalidInput("Invalid Signature encoding".to_string()))?;
+        Ok(Self(inner))
+    }
+}
+
+impl Serialize for Signature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.to_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Signature::try_from(bytes.as_slice()).map_err(serde::de::Error::custom)
+    }
+}
 
 #[uniffi::export]
 impl Signature {
     #[uniffi::constructor]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
-        let inner = k256::ecdsa::Signature::from_bytes(bytes.into())
-            .map_err(|_| GeneralError::InvalidInput("Invalid Signature encoding".to_string()))?;
-        Ok(Self(inner))
+        Self::try_from(bytes)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -180,7 +213,7 @@ impl Signer<k256::ecdsa::Signature> for &NodeSecretKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object)]
 pub struct NodeVerifyingKey {
-    inner: VerifyingKey,
+    pub inner: VerifyingKey,
     bytes: Box<[u8]>,
 }
 

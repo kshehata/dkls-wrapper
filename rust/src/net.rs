@@ -169,7 +169,7 @@ pub struct InMemoryBridge {
 
 impl InMemoryBridge {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(100);
+        let (tx, _) = broadcast::channel(100000);
         Self {
             tx,
             next_id: std::sync::atomic::AtomicUsize::new(0),
@@ -210,10 +210,15 @@ impl NetworkInterface for InMemoryNetworkInterface {
             match rx.recv().await {
                 Ok((id, data)) => {
                     if id != self.id {
+                        // simulate network delay, otherwise could overwhelm buffers.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         return Ok(data);
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    println!("Relay LAGGED: skipped {} messages", skipped);
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(GeneralError::MessageSendError)
                 }
