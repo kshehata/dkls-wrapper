@@ -1,84 +1,84 @@
+import ArgumentParser
 import CLICore
 import DKLSLib
 import Foundation
 import MQTTNIO
 import NIO
 
+struct DKGArgs: ParsableCommand {
+    @Argument(help: "Name of this device.")
+    var name: String
+
+    @Option(
+        help:
+            "InstanceID to use in Base64 encoding. If not set, a random InstanceID will be generated."
+    )
+    var instanceID: String = ""
+
+    @Option(name: .shortAndLong, help: "Threshold number of devices. Only valid for new instances.")
+    var threshold: UInt8 = 2
+
+    @Option(name: .shortAndLong, help: "Output filename.")
+    var outputFilename: String = "keyshare"
+
+    @Option(name: .long, help: "MQTT host.")
+    var mqttHost: String = "localhost"
+
+    @Option(name: .long, help: "MQTT port.")
+    var mqttPort: Int = 1883
+
+    @Option(name: .shortAndLong, help: "QR Data from other party.")
+    var qrData: String = ""
+
+    func validate() throws {
+        if name.isEmpty {
+            throw ValidationError("Name cannot be empty")
+        }
+        if qrData.isEmpty {
+            if !instanceID.isEmpty {
+                guard let data = Data(base64Encoded: instanceID) else {
+                    throw ValidationError("Instance ID must be valid base64")
+                }
+                do {
+                    _ = try InstanceId.fromBytes(bytes: data)
+                } catch {
+                    throw ValidationError("Invalid Instance ID")
+                }
+            }
+            if threshold < 2 {
+                throw ValidationError("Threshold must be at least 2")
+            }
+        } else {
+            guard Data(base64Encoded: qrData) != nil else {
+                throw ValidationError("QR Data must be valid base64")
+            }
+            if !instanceID.isEmpty {
+                throw ValidationError("Cannot set InstanceID when using QR Data.")
+            }
+        }
+    }
+}
+
 print(colorize("DKLS CLI DKG Test", .cyan))
 print()
 
-let dkgNode: DkgNode
-let args = ProcessInfo.processInfo.arguments
-if args.count <= 2 {
-    print(colorize("Paste the setup bytes from the other party:", .red))
-    let setupBase64 = readLine()!
-    do {
-        dkgNode = try DkgNode.fromSetupBytes(setup: Data(base64Encoded: setupBase64)!)
-    } catch {
-        print(colorize("Error parsing setup bytes", .red))
-        exit(1)
-    }
-
-} else if args.count == 3 || args.count == 4 {
-    let instanceID: InstanceId
-    if args[1] == "-" {
-        instanceID = InstanceId.fromEntropy()
-    } else {
-        guard let data = Data(base64Encoded: args[1]) else {
-            print(colorize("Error: Invalid base64 for Instance ID", .red))
-            exit(1)
-        }
-        do {
-            instanceID = try InstanceId.fromBytes(bytes: data)
-        } catch {
-            print(colorize("Error: Invalid Instance ID bytes", .red))
-            exit(1)
-        }
-    }
-    let threshold = UInt8(args[2])!
-    dkgNode = DkgNode.starter(instance: instanceID, threshold: threshold)
-
-} else {
-    print(
-        colorize(
-            "Usage: \(args[0]) <instanceID|-> <threshold> <outputFilename>",
-            .red))
+let dkgArgs: DKGArgs
+do {
+    dkgArgs = try DKGArgs.parse()
+} catch {
+    print(colorize("Error parsing arguments: \(error)", .red))
     exit(1)
 }
 
-let outputFilename: String
-if args.count == 4 {
-    outputFilename = args[3]
-} else if args.count == 2 {
-    outputFilename = args[1]
-} else {
-    outputFilename = "keyshare\(dkgNode.partyId())"
-}
-if !checkWriteable(outputFilename) {
-    print(colorize("Error: Cannot write to \(outputFilename)", .red))
-    exit(1)
-}
-print(
-    colorize(
-        "Saving keyshare to \(outputFilename)",
-        .cyan))
-
-let instanceStr = hexString(dkgNode.instanceId().toBytes())
-print(
-    colorize(
-        "🆔 Using Instance ID: \(instanceStr)",
-        .cyan))
-print(
-    colorize(
-        "Settings: n = \(dkgNode.threshold()), t = \(dkgNode.threshold()), i = \(dkgNode.partyId())",
-        .cyan))
-print(colorize("Setup bytes:", .cyan))
-print(dkgNode.setupBytes().base64EncodedString())
+let outputFilename = dkgArgs.outputFilename + "_" + dkgArgs.name
+print("Output filename: \(outputFilename)")
+print("MQTT host: \(dkgArgs.mqttHost)")
+print("MQTT port: \(dkgArgs.mqttPort)")
 print()
 
 let client = MQTTClient(
-    host: ProcessInfo.processInfo.environment["MQTT_HOST"] ?? "localhost",
-    port: Int(ProcessInfo.processInfo.environment["MQTT_PORT"] ?? "1883")!,
+    host: dkgArgs.mqttHost,
+    port: dkgArgs.mqttPort,
     identifier: "swift-\(ProcessInfo.processInfo.processIdentifier)",
     eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
     configuration: .init(version: .v5_0)
@@ -97,54 +97,91 @@ do {
 print(colorize("👂 Listening for messages...", .yellow))
 let setupInterface = MQTTInterface(
     client: client,
-    topic: "dkg_setup/\(instanceStr)"
+    topic: "dkg_setup/"
 )
 
-Task {
-    do {
-        print(colorize("Waiting for other party's setup string...", .yellow))
-        while true {
-            let data = try await setupInterface.receive()
-            print(colorize("Received Setup String: \(data.count) bytes", .magenta))
-            do {
-                try dkgNode.updateFromBytes(setup: data)
-            } catch {
-                print(colorize("Error updating from received setup: \(error)", .red))
-            }
+let dkgInterface = MQTTInterface(
+    client: client,
+    topic: "dkg/"
+)
+
+let dkgNode: DkgNode
+if dkgArgs.qrData.isEmpty {
+    let instanceID: InstanceId
+    if dkgArgs.instanceID.isEmpty {
+        instanceID = InstanceId.fromEntropy()
+    } else {
+        do {
+            instanceID = try InstanceId.fromBytes(bytes: Data(base64Encoded: dkgArgs.instanceID)!)
+        } catch {
+            print(colorize("This should never happen: Invalid Instance ID", .red))
+            exit(1)
         }
+    }
+    let instanceStr = hexString(instanceID.toBytes())
+    print(
+        colorize(
+            "Starting DKG as starter for instance \(instanceStr), threshold \(dkgArgs.threshold)",
+            .yellow
+        ))
+    dkgNode = DkgNode.init(
+        name: dkgArgs.name, instance: instanceID, threshold: dkgArgs.threshold,
+        setupIf: setupInterface, dkgIf: dkgInterface)
+
+    do {
+        try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))
     } catch {
-        print(colorize("Error receiving messages: \(error)", .red))
+        // Should never happen at this point.
+        print(colorize("Error getting QR data: \(error)", .red))
+        exit(1)
+    }
+
+} else {
+    print(colorize("Starting DKG as participant for QR data \(dkgArgs.qrData)", .yellow))
+    do {
+        dkgNode = try DkgNode.tryFromQrBytes(
+            name: dkgArgs.name, qrBytes: Data(base64Encoded: dkgArgs.qrData)!,
+            setupIf: setupInterface,
+            dkgIf: dkgInterface)
+    } catch {
+        print(colorize("Error parsing QR data: \(error)", .red))
+        exit(1)
     }
 }
 
-let service = MQTTInterface(
-    client: client,
-    topic: "dkg/\(instanceStr)"
-)
-
-print(colorize("✓ Connected to message stream", .green))
-print()
-
-do {
-    try await setupInterface.send(data: dkgNode.setupBytes())
-    print(colorize("✓ Sent setup string", .green))
-} catch {
-    print(colorize("Error sending setup string: \(error)", .red))
-    exit(1)
+var messageLoopTask = Task {
+    do {
+        print(colorize("Starting message loop...", .yellow))
+        try await dkgNode.messageLoop()
+    } catch {
+        print(colorize("Error in message loop: \(error)", .red))
+    }
+    print(colorize("Message loop completed.", .magenta))
 }
 
+// TODO: This should wait until we're in the ready state.
 await Task.detached {
-    print(colorize("Ready. Press enter to start.", .magenta))
-    _ = readLine()
+    print(colorize("Waiting for parties. Type start to send start message.", .magenta))
+    let line = readLine()
+    if line != "start" {
+        return
+    }
+    print(colorize("Starting DKG", .yellow))
+    do {
+        try await dkgNode.startDkg()
+    } catch {
+        print(colorize("Error starting DKG: \(error)", .red))
+        exit(1)
+    }
 }.value
 
+print(colorize("Waiting for DKG to complete...", .yellow))
+await messageLoopTask.value
+
 do {
-    print(colorize("Generating key shares...", .yellow))
-    let share = try await dkgNode.doKeygen(interface: service)
-    print(colorize("✓ Key shares generated", .green))
-    print()
+    let share = try dkgNode.getResult()
     share.print()
-    print(colorize("Key share bytes: \(share.toBytes().count) bytes", .magenta))
+    // print(colorize("Key share bytes: \(share.toBytes().count) bytes", .magenta))
     try share.toBytes().write(to: URL(fileURLWithPath: outputFilename))
     print(colorize("✓ Key share written to \(outputFilename)", .green))
 } catch {

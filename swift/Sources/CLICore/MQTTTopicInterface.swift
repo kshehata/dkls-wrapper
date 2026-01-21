@@ -57,7 +57,8 @@ public class MQTTInterface: NetworkInterface {
         try await client.publish(
             to: topic,
             payload: ByteBuffer(data: data),
-            qos: .atLeastOnce
+            qos: .atLeastOnce,
+            retain: true,
         ).get()
     }
 

@@ -31,7 +31,11 @@ let package = Package(
         .package(
             url: "https://github.com/swift-server-community/mqtt-nio.git",
             from: "2.12.1"
-        )
+        ),
+        .package(
+            url: "https://github.com/apple/swift-argument-parser.git",
+            from: "1.3.0"
+        ),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -53,6 +57,7 @@ let package = Package(
                 "CLICore",
                 "DKLSLib",
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .executableTarget(
