@@ -31,8 +31,13 @@ pub fn hash_sig_req(instance: &InstanceId, msg_hash: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-// Message sent on the network to request or join a signature party.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/*****************************************************************************
+ * Signature Request
+ * Represents a signature request from another node, whether within the app
+ * or on the wire.
+ *****************************************************************************/
+
+#[derive(uniffi::Object, Clone, Debug, Serialize, Deserialize)]
 pub struct SignRequest {
     pub instance: InstanceId,
     pub message: Arc<Vec<u8>>,
@@ -58,7 +63,9 @@ impl TryFrom<&str> for SignRequest {
     }
 }
 
+#[uniffi::export]
 impl SignRequest {
+    #[uniffi::constructor]
     pub fn for_message_bytes(
         instance: &InstanceId,
         message: Vec<u8>,
@@ -77,6 +84,7 @@ impl SignRequest {
         }
     }
 
+    #[uniffi::constructor]
     pub fn for_message_string(
         instance: &InstanceId,
         message: &str,
@@ -94,11 +102,37 @@ impl SignRequest {
         serde_json::to_string(self).unwrap()
     }
 
-    pub fn get_msg_hash(&self) -> [u8; 32] {
-        match self.hash {
-            Some(hash) => hash,
-            None => hash_message(&self.message),
-        }
+    pub fn instance(&self) -> InstanceId {
+        self.instance
+    }
+
+    // This is extremely inefficient, but it's the only way in UniFFI.
+    pub fn message(&self) -> Vec<u8> {
+        self.message.as_ref().clone()
+    }
+
+    pub fn message_str(&self) -> String {
+        String::from_utf8_lossy(&self.message).to_string()
+    }
+
+    pub fn msg_hash(&self) -> Vec<u8> {
+        self.get_msg_hash().to_vec()
+    }
+
+    // Again inefficient but we don't have a choice when using UniFFI.
+    pub fn party_vk(&self) -> Vec<Arc<NodeVerifyingKey>> {
+        self.party_vk
+            .iter()
+            .map(|vk| Arc::new(vk.clone()))
+            .collect()
+    }
+
+    pub fn sigs(&self) -> Vec<Arc<Signature>> {
+        self.sigs.iter().map(|sig| Arc::new(sig.clone())).collect()
+    }
+
+    pub fn req_hash(&self) -> Vec<u8> {
+        self.get_req_hash().to_vec()
     }
 
     pub fn check_sigs(&self) -> Result<(), GeneralError> {
@@ -121,7 +155,7 @@ impl SignRequest {
                 "No signatures or party VKs".to_string(),
             ));
         }
-        let req_hash = hash_sig_req(&self.instance, &self.get_msg_hash());
+        let req_hash = self.get_req_hash();
         for (sig, vk) in self.sigs.iter().zip(self.party_vk.iter()) {
             match vk.verify(&req_hash, &sig) {
                 Ok(_) => continue,
@@ -133,10 +167,23 @@ impl SignRequest {
         }
         Ok(())
     }
+}
+
+impl SignRequest {
+    pub fn get_msg_hash(&self) -> [u8; 32] {
+        match self.hash {
+            Some(hash) => hash,
+            None => hash_message(&self.message),
+        }
+    }
+
+    pub fn get_req_hash(&self) -> [u8; 32] {
+        hash_sig_req(&self.instance, &self.get_msg_hash())
+    }
 
     // Basically strip out the message, add the hash, and sign it ourselves.
     pub fn get_join_reply(&self, vk: &NodeVerifyingKey, sk: &NodeSecretKey) -> SignRequest {
-        let req_hash = hash_sig_req(&self.instance, &self.get_msg_hash());
+        let req_hash = self.get_req_hash();
         let req_sig = Signature(sk.sign(&req_hash));
         SignRequest {
             instance: self.instance,
@@ -211,13 +258,17 @@ impl SignRequest {
     }
 }
 
-// Context for signing requests.
+/*****************************************************************************
+ * Support structs for SignNode.
+ *****************************************************************************/
 pub struct SignNodeContext {
     pub my_vk: NodeVerifyingKey,
     pub secret_key: Arc<NodeSecretKey>,
     pub keyshare: Keyshare,
 }
 
+// Helper to do the actual signature for a given request using the context
+// and relay. Made general for testing.
 pub async fn do_sign_relay<R: Relay>(
     ctx: Arc<SignNodeContext>,
     req: SignRequest,
@@ -238,6 +289,8 @@ pub async fn do_sign_relay<R: Relay>(
     Ok(Signature(sign_run(setup_msg, rng.gen(), relay).await?.0))
 }
 
+// Encapsulate a signing session originating from us.
+// Waits for others to join and then sends start.
 pub struct SignOriginatingSession {
     pub ctx: Arc<SignNodeContext>,
     pub req: SignRequest,
@@ -307,16 +360,21 @@ impl SignOriginatingSession {
     }
 }
 
+// Encapsulation of joining signing session originated by another party.
+// Sends out our joining message and then waits for the start before signing.
 pub struct SignReplySession {
     pub ctx: Arc<SignNodeContext>,
-    pub req: SignRequest,
+    pub req: Arc<SignRequest>,
 }
 
 impl SignReplySession {
     /// Join a signing request.
     /// If the request is valid, create a session for joining it.
     /// If the request is invalid, returns an error.
-    pub fn join_request(ctx: Arc<SignNodeContext>, req: SignRequest) -> Result<Self, GeneralError> {
+    pub fn join_request(
+        ctx: Arc<SignNodeContext>,
+        req: Arc<SignRequest>,
+    ) -> Result<Self, GeneralError> {
         if req.message.is_empty() {
             return Err(GeneralError::InvalidInput("No message".to_string()));
         }
@@ -395,6 +453,11 @@ impl SignReplySession {
     }
 }
 
+/*****************************************************************************
+ * DSG Node Representation.
+ *****************************************************************************/
+
+#[derive(Clone, uniffi::Object)]
 struct SignNode {
     ctx: Arc<SignNodeContext>,
 }
@@ -413,20 +476,12 @@ impl SignNode {
     /// Join a signing request.
     /// If the request is valid, gives the response to be sent to the original requester.
     /// If the request is invalid, returns an error.
-    pub fn join_request(&self, req: SignRequest) -> Result<SignReplySession, GeneralError> {
+    pub fn join_request(&self, req: Arc<SignRequest>) -> Result<SignReplySession, GeneralError> {
         SignReplySession::join_request(self.ctx.clone(), req)
-    }
-
-    // Get the next signing request from the network interface.
-    pub async fn get_next_req(
-        &self,
-        net_if: Arc<dyn NetworkInterface>,
-    ) -> Result<SignRequest, GeneralError> {
-        let msg = net_if.receive().await?;
-        SignRequest::try_from(msg.as_slice())
     }
 }
 
+#[uniffi::export]
 impl SignNode {
     #[uniffi::constructor]
     pub fn new(secret_key: Arc<NodeSecretKey>, keyshare: &Keyshare) -> Self {
@@ -437,6 +492,42 @@ impl SignNode {
                 keyshare: keyshare.clone(),
             }),
         }
+    }
+
+    // Get the next signing request from the network interface.
+    pub async fn get_next_req(
+        &self,
+        net_if: Arc<dyn NetworkInterface>,
+    ) -> Result<SignRequest, GeneralError> {
+        let msg = net_if.receive().await?;
+        SignRequest::try_from(msg.as_slice())
+    }
+
+    pub async fn do_sign_bytes(
+        &self,
+        bytes: Vec<u8>,
+        net_if: Arc<dyn NetworkInterface>,
+    ) -> Result<Signature, GeneralError> {
+        let sess = self.new_request_bytes(bytes);
+        sess.process(net_if).await
+    }
+
+    pub async fn do_sign_string(
+        &self,
+        string: &str,
+        net_if: Arc<dyn NetworkInterface>,
+    ) -> Result<Signature, GeneralError> {
+        let sess = self.new_request_string(string);
+        sess.process(net_if).await
+    }
+
+    pub async fn do_join_request(
+        &self,
+        req: Arc<SignRequest>,
+        net_if: Arc<dyn NetworkInterface>,
+    ) -> Result<Signature, GeneralError> {
+        let sess = self.join_request(req)?;
+        sess.process(net_if).await
     }
 }
 
@@ -592,7 +683,7 @@ mod tests {
 
         // Node 1 joins by sending a reply to Node 0.
         let req = SignRequest::try_from(req_bytes.as_slice()).unwrap();
-        let join_sess = nodes[1].join_request(req).unwrap();
+        let join_sess = nodes[1].join_request(Arc::new(req)).unwrap();
         let reply_bytes = join_sess.get_reply_bytes();
 
         // Node 0 processes the reply and updates the request state.
@@ -671,8 +762,60 @@ mod tests {
 
         for (n, net) in nodes.iter().zip(nets.into_iter()) {
             let req = n.get_next_req(net.clone()).await.unwrap();
-            let join_sess = n.join_request(req).unwrap();
+            let join_sess = n.join_request(Arc::new(req)).unwrap();
             parties.spawn(async move { join_sess.process(net).await });
+        }
+
+        println!("Waiting for signing nodes");
+        // collect all of the shares
+        let mut results = vec![];
+        while let Some(fini) = parties.join_next().await {
+            if let Err(ref err) = fini {
+                println!("error {err:?}");
+            } else {
+                match fini.unwrap() {
+                    Err(err) => panic!("err {:?}", err),
+                    Ok(share) => results.push(share),
+                }
+            }
+        }
+
+        while let Some(res) = parties.join_next().await {
+            let sig = res.unwrap().unwrap();
+            assert!(vk.verify(&message.as_bytes(), &sig).is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_signing_shortcuts() {
+        let (t, n) = (3usize, 5usize);
+        let (party_sk, _party_vk, shares) = gen_keyshares(t as u8, n as u8).await;
+
+        // Value to be signed
+        let message = "Hello World";
+        let vk = shares[0].vk();
+
+        let mut nodes = party_sk
+            .into_iter()
+            .zip(shares)
+            .map(|(sk, share)| SignNode::new(sk, &share))
+            .collect::<Vec<_>>();
+
+        // Node 0 generates a signing request and sends to all others.
+
+        let coord = InMemoryBridge::new();
+        let r1 = coord.connect();
+        let nets = (1..t).map(|_| coord.connect()).collect::<Vec<_>>();
+        let mut parties = tokio::task::JoinSet::new();
+        {
+            let n = nodes.pop().unwrap();
+            parties.spawn(async move { n.do_sign_string(message, r1).await });
+        }
+
+        for (n, net) in nodes.into_iter().zip(nets.into_iter()) {
+            let req = n.get_next_req(net.clone()).await.unwrap();
+            // Simulate getting approval
+            parties.spawn(async move { n.do_join_request(Arc::new(req), net).await });
         }
 
         println!("Waiting for signing nodes");
