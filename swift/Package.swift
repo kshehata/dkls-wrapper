@@ -66,6 +66,7 @@ let package = Package(
                 "CLICore",
                 "DKLSLib",
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .testTarget(
