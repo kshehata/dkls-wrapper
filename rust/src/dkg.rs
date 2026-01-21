@@ -23,10 +23,16 @@ pub struct DKGNode {
     // Need interior mutability for state,
     // Option so that we can replace it dynamically.
     state: RwLock<Option<Box<dyn DKGInternalState>>>,
+    listeners: RwLock<Vec<Box<dyn DKGStateChangeListener>>>,
     context: DKGContext,
     setup_if: Arc<dyn NetworkInterface>,
     dkg_if: Arc<dyn NetworkInterface>,
     await_msg_kick: Notify,
+}
+
+#[uniffi::export(callback_interface)]
+pub trait DKGStateChangeListener: Send + Sync {
+    fn on_state_changed(&self, old_state: DKGState, new_state: DKGState);
 }
 
 #[uniffi::export]
@@ -52,6 +58,7 @@ impl DKGNode {
         };
         Self {
             state: RwLock::new(Some(DKGReadyState::new(setup))),
+            listeners: RwLock::new(Vec::new()),
             context,
             setup_if,
             dkg_if,
@@ -78,6 +85,10 @@ impl DKGNode {
         self.state.read().unwrap().as_ref().unwrap().get_state()
     }
 
+    pub fn add_state_change_listener(&self, listener: Box<dyn DKGStateChangeListener>) {
+        self.listeners.write().unwrap().push(listener);
+    }
+
     pub fn receive_qr_bytes(&self, qr_bytes: &Vec<u8>) -> Result<(), GeneralError> {
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
         self.receive_qr(qr_data)
@@ -89,23 +100,10 @@ impl DKGNode {
 
     // User pressed the "go" button.
     pub async fn start_dkg(&self) -> Result<(), GeneralError> {
-        let bytes_to_send = {
-            let mut guard = self.state.write().unwrap();
-            let current_state = guard.take().unwrap();
-            let (new_state, res) = current_state.start_dkg(&self.context);
-            if let Err(e) = res {
-                *guard = Some(new_state);
-                return Err(e);
-            }
-            let bytes_to_send = new_state.get_setup().unwrap().to_bytes();
-            *guard = Some(new_state);
-            bytes_to_send
-        };
+        let bytes_to_send = self.do_state_fn(|state| state.start_dkg(&self.context))?;
         if !bytes_to_send.is_empty() {
-            // println!("{:?} Sending start message", self.context.friendly_name);
             self.setup_if.send(bytes_to_send).await?;
         }
-        // println!("{:?} Notifying waiters", self.context.friendly_name);
         self.await_msg_kick.notify_waiters();
         Ok(())
     }
@@ -158,8 +156,7 @@ impl DKGNode {
         let res = self.do_dkg_internal(setup.clone()).await;
         // println!("{:?} DKG Complete?", self.context.friendly_name);
 
-        let mut guard = self.state.write().unwrap();
-        *guard = Some(DKGFinishedState::new(setup, res));
+        let _ = self.do_state_fn(|_| (DKGFinishedState::new(setup, res), Ok(())));
         Ok(())
     }
 }
@@ -177,6 +174,7 @@ impl DKGNode {
         };
         Self {
             state: RwLock::new(Some(DKGWaitForNetState::new(qr_data))),
+            listeners: RwLock::new(Vec::new()),
             context,
             setup_if,
             dkg_if,
@@ -189,11 +187,7 @@ impl DKGNode {
     }
 
     pub fn receive_qr(&self, qr: QRData) -> Result<(), GeneralError> {
-        let mut guard = self.state.write().unwrap();
-        let current_state = guard.take().unwrap();
-        let (new_state, res) = current_state.scan_qr(&self.context, qr);
-        *guard = Some(new_state);
-        res
+        self.state.write().unwrap().as_mut().unwrap().scan_qr(qr)
     }
 
     // Shortcut to receive and parse a setup message.
@@ -212,27 +206,12 @@ impl DKGNode {
         // println!("{:?} Waiting for setup message", self.context.friendly_name);
         let setup_msg = self.get_next_msg_interruptable().await?;
         // println!("{:?} Received setup message", self.context.friendly_name);
-        let bytes_to_send = self.receive_setup_msg_internal(setup_msg)?;
+        let bytes_to_send =
+            self.do_state_fn(|state| state.receive_setup_msg(&self.context, setup_msg))?;
         if !bytes_to_send.is_empty() {
             self.setup_if.send(bytes_to_send).await?;
         }
         Ok(())
-    }
-
-    fn receive_setup_msg_internal(
-        &self,
-        setup_msg: DKGSetupMessage,
-    ) -> Result<Vec<u8>, GeneralError> {
-        let mut guard = self.state.write().unwrap();
-        let current_state = guard.take().unwrap();
-        let (new_state, res) = current_state.receive_setup_msg(&self.context, setup_msg);
-        let bytes_to_send = if res? {
-            new_state.get_setup().unwrap().to_bytes()
-        } else {
-            vec![]
-        };
-        *guard = Some(new_state);
-        Ok(bytes_to_send)
     }
 
     async fn do_dkg_internal(&self, setup: Arc<DKGSetupMessage>) -> Result<Keyshare, GeneralError> {
@@ -263,6 +242,38 @@ impl DKGNode {
         // println!("{:?} keygen_run done", self.context.friendly_name);
 
         result
+    }
+
+    // helper to do all the complicated magic of taking the state
+    // out of the guard, running a function, putting it back,
+    // and notifying listeners.
+    fn do_state_fn<F, O>(&self, f: F) -> Result<O, GeneralError>
+    where
+        F: FnOnce(
+            Box<dyn DKGInternalState>,
+        ) -> (Box<dyn DKGInternalState>, Result<O, GeneralError>),
+    {
+        let (old_state_enum, new_state_enum, res) = {
+            let mut guard = self.state.write().unwrap();
+            let current_state = guard.take().unwrap();
+            let old_state_enum = current_state.get_state();
+            let (new_state, res) = f(current_state);
+            let new_state_enum = new_state.get_state();
+            *guard = Some(new_state);
+            (old_state_enum, new_state_enum, res)
+        };
+        self.notify_listeners(old_state_enum, new_state_enum);
+        res
+    }
+
+    fn notify_listeners(&self, old_state: DKGState, new_state: DKGState) {
+        if old_state == new_state {
+            return;
+        }
+        let listeners = self.listeners.read().unwrap();
+        for listener in listeners.iter() {
+            listener.on_state_changed(old_state, new_state);
+        }
     }
 }
 
@@ -342,7 +353,7 @@ impl DKGSetupMessage {
         serde_json::to_string(self).unwrap()
     }
 
-    fn verify_qr(&mut self, qr: &QRData) -> Result<&mut Self, GeneralError> {
+    fn verify_qr(&mut self, qr: &QRData) -> Result<(), GeneralError> {
         if self.instance != qr.instance
             || self.parties.len() <= self.party_id as usize
             || self.parties[self.party_id as usize].vk != qr.vk
@@ -353,7 +364,7 @@ impl DKGSetupMessage {
         }
         self.parties[qr.party_id as usize].verified = true;
 
-        Ok(self)
+        Ok(())
     }
 
     fn add_ourself(&mut self, name: &str, sk: &NodeSecretKey) -> &mut Self {
@@ -394,7 +405,7 @@ impl DKGSetupMessage {
  * DKG State Machine
  *****************************************************************************/
 
-#[derive(Debug, PartialEq, uniffi::Enum)]
+#[derive(Debug, PartialEq, Clone, Copy, uniffi::Enum)]
 pub enum DKGState {
     WaitForSetup,
     WaitForParties,
@@ -423,22 +434,22 @@ trait DKGInternalState: Send + Sync + 'static {
         ))
     }
 
-    fn scan_qr(
-        self: Box<Self>,
-        context: &DKGContext,
-        qr_data: QRData,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>);
+    fn scan_qr(&mut self, _: QRData) -> Result<(), GeneralError> {
+        Err(GeneralError::InvalidState(
+            "Cannot scan QR in current state.".to_string(),
+        ))
+    }
 
     fn receive_setup_msg(
         self: Box<Self>,
         context: &DKGContext,
         setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>);
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>);
 
     fn start_dkg(
         self: Box<Self>,
         context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>);
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>);
 
     fn get_result(&self) -> Result<Keyshare, GeneralError> {
         Err(GeneralError::InvalidState(
@@ -468,37 +479,25 @@ impl DKGInternalState for DKGWaitForNetState {
         DKGState::WaitForSetup
     }
 
-    fn scan_qr(
-        self: Box<Self>,
-        _: &DKGContext,
-        _: QRData,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState(
-                "Cannot scan QR in current state.".to_string(),
-            )),
-        )
-    }
-
     fn receive_setup_msg(
         self: Box<Self>,
         context: &DKGContext,
         mut setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         if let Err(e) = setup_msg.verify_qr(&self.qr_data) {
             return (self, Err(e));
         }
         setup_msg.add_ourself(&context.friendly_name, &context.sk);
 
         // Always have to send an update to the network.
-        (DKGReadyState::new(setup_msg), Ok(true))
+        let bytes_to_send = setup_msg.to_bytes();
+        (DKGReadyState::new(setup_msg), Ok(bytes_to_send))
     }
 
     fn start_dkg(
         self: Box<Self>,
         _context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -547,23 +546,15 @@ impl DKGInternalState for DKGReadyState {
         Ok(self.setup.clone())
     }
 
-    fn scan_qr(
-        mut self: Box<Self>,
-        _: &DKGContext,
-        qr_data: QRData,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        let res = Arc::make_mut(&mut self.setup)
-            .verify_qr(&qr_data)
-            .map(|_| ());
-
-        (self, res)
+    fn scan_qr(&mut self, qr_data: QRData) -> Result<(), GeneralError> {
+        Arc::make_mut(&mut self.setup).verify_qr(&qr_data)
     }
 
     fn receive_setup_msg(
         self: Box<Self>,
         _context: &DKGContext,
         mut setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         if let Err(e) = setup_msg.verify_existing(&self.setup) {
             return (self, Err(e));
         }
@@ -582,16 +573,17 @@ impl DKGInternalState for DKGReadyState {
                     )),
                 );
             }
-            (DKGRunningState::new(setup_msg), Ok(true))
+            let bytes_to_send = setup_msg.to_bytes();
+            (DKGRunningState::new(setup_msg), Ok(bytes_to_send))
         } else {
-            (Self::new(setup_msg), Ok(false))
+            (Self::new(setup_msg), Ok(vec![]))
         }
     }
 
     fn start_dkg(
         self: Box<Self>,
         _context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         if self.setup.parties.len() < self.setup.threshold as usize {
             (
                 self,
@@ -602,7 +594,8 @@ impl DKGInternalState for DKGReadyState {
         } else {
             let mut setup = Arc::unwrap_or_clone(self.setup);
             setup.start = true;
-            (DKGRunningState::new(setup), Ok(()))
+            let bytes_to_send = setup.to_bytes();
+            (DKGRunningState::new(setup), Ok(bytes_to_send))
         }
     }
 }
@@ -633,24 +626,11 @@ impl DKGInternalState for DKGRunningState {
         Ok(self.setup.clone())
     }
 
-    fn scan_qr(
-        self: Box<Self>,
-        _: &DKGContext,
-        _: QRData,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState(
-                "Cannot scan QR in current state.".to_string(),
-            )),
-        )
-    }
-
     fn receive_setup_msg(
         self: Box<Self>,
         _context: &DKGContext,
         _setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -662,7 +642,7 @@ impl DKGInternalState for DKGRunningState {
     fn start_dkg(
         self: Box<Self>,
         _: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -709,7 +689,7 @@ impl DKGInternalState for DKGFinishedState {
         self: Box<Self>,
         _context: &DKGContext,
         _setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -718,23 +698,10 @@ impl DKGInternalState for DKGFinishedState {
         )
     }
 
-    fn scan_qr(
-        self: Box<Self>,
-        _: &DKGContext,
-        _: QRData,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
-        (
-            self,
-            Err(GeneralError::InvalidState(
-                "Cannot scan QR in current state.".to_string(),
-            )),
-        )
-    }
-
     fn start_dkg(
         self: Box<Self>,
         _: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<(), GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -829,5 +796,68 @@ mod tests {
         // Wait for both nodes to finish DKG.
         assert!(wait_for_state(nodes[1].clone(), DKGState::Finished, 500).await);
         assert!(wait_for_state(nodes[0].clone(), DKGState::Finished, 500).await);
+    }
+
+    #[tokio::test]
+    async fn test_state_listener() {
+        struct TestListener {
+            changes: Arc<RwLock<Vec<(DKGState, DKGState)>>>,
+        }
+
+        impl DKGStateChangeListener for TestListener {
+            fn on_state_changed(&self, old: DKGState, new: DKGState) {
+                self.changes.write().unwrap().push((old, new));
+            }
+        }
+
+        let changes = Arc::new(RwLock::new(Vec::new()));
+        let listener = TestListener {
+            changes: changes.clone(),
+        };
+
+        let instance = InstanceId::from_entropy();
+        let setup_if = InMemoryBridge::new();
+        let dkg_if = InMemoryBridge::new();
+        let other_conn = setup_if.connect();
+
+        let node = Arc::new(DKGNode::new(
+            "ListenerNode",
+            &instance,
+            2,
+            setup_if.connect(),
+            dkg_if.connect(),
+        ));
+
+        node.add_state_change_listener(Box::new(listener));
+
+        let node_ref = node.clone();
+        tokio::spawn(async move {
+            let _ = node_ref.message_loop().await;
+        });
+
+        // 1. Receive the initial setup message (broadcast by node).
+        // It broadcasts because it starts in WaitForParties (1 < 2).
+        let received_bytes = other_conn.receive().await.unwrap();
+        let mut setup_msg = DKGSetupMessage::try_from(received_bytes.as_slice()).unwrap();
+
+        // 2. Add another party to it.
+        let other_sk = NodeSecretKey::from_entropy();
+        setup_msg.add_ourself("OtherNode", &other_sk);
+
+        // 3. Send it back.
+        other_conn.send(setup_msg.to_bytes()).await.unwrap();
+
+        // 4. Wait for state change to Ready.
+        assert!(wait_for_state(node.clone(), DKGState::Ready, 50).await);
+
+        let changes_vec = changes.read().unwrap();
+        // We expect at least one transition to Ready.
+        // Depending on timing, we might see intermediate states if any (none here).
+        // Transition: WaitForParties -> Ready.
+        assert!(!changes_vec.is_empty());
+        assert_eq!(
+            changes_vec.last().unwrap(),
+            &(DKGState::WaitForParties, DKGState::Ready)
+        );
     }
 }

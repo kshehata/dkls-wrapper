@@ -538,7 +538,6 @@ mod tests {
     use super::*;
     use sl_dkls23::keygen::run as keygen_run;
     use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
-    use tokio::time::{timeout, Duration};
 
     #[test]
     pub fn test_sig_req() {
