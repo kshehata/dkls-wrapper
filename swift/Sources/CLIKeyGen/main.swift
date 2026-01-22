@@ -159,6 +159,22 @@ var messageLoopTask = Task {
     print(colorize("Message loop completed.", .magenta))
 }
 
+final class SetupChangeListener: DkgSetupChangeListener, @unchecked Sendable {
+    func onSetupChanged(setup: DkgSetupMessage) {
+        let parties = setup.getParties()
+        print("\n" + colorize("--- DKG Setup Update ---", .magenta))
+        // print("Instance: \(hexString(setup.getInstance().toBytes()))")
+        print("Threshold: \(setup.getThreshold())")
+        print("Parties (\(parties.count)):")
+        for (i, party) in parties.enumerated() {
+            let verified = party.isVerified() ? " (Verified)" : ""
+            let mark = party.isVerified() ? "✓" : "?"  // u2713
+            print("  \(i + 1). \(mark) \(party.name())\(verified)")
+        }
+        print(colorize("------------------------", .magenta) + "\n")
+    }
+}
+
 final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
     let inputTask: Task<Void, Never>?
 
@@ -200,6 +216,9 @@ var inputTask = Task.detached {
 
 let listener = StateChangeListener(inputTask: inputTask)
 dkgNode.addStateChangeListener(listener: listener)
+
+let setupListener = SetupChangeListener()
+dkgNode.addSetupChangeListener(listener: setupListener)
 
 print(colorize("Waiting for DKG to complete...", .yellow))
 await messageLoopTask.value

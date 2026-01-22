@@ -378,3 +378,18 @@ impl DeviceInfo {
         }
     }
 }
+
+#[uniffi::export]
+impl DeviceInfo {
+    pub fn name(&self) -> String {
+        self.friendly_name.clone()
+    }
+
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
+
+    pub fn vk(&self) -> NodeVerifyingKey {
+        self.vk.clone()
+    }
+}

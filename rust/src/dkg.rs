@@ -24,10 +24,16 @@ pub struct DKGNode {
     // Option so that we can replace it dynamically.
     state: RwLock<Option<Box<dyn DKGInternalState>>>,
     listeners: RwLock<Vec<Box<dyn DKGStateChangeListener>>>,
+    setup_listeners: RwLock<Vec<Box<dyn DKGSetupChangeListener>>>,
     context: DKGContext,
     setup_if: Arc<dyn NetworkInterface>,
     dkg_if: Arc<dyn NetworkInterface>,
     await_msg_kick: Notify,
+}
+
+#[uniffi::export(callback_interface)]
+pub trait DKGSetupChangeListener: Send + Sync {
+    fn on_setup_changed(&self, setup: Arc<DKGSetupMessage>);
 }
 
 #[uniffi::export(callback_interface)]
@@ -59,6 +65,7 @@ impl DKGNode {
         Self {
             state: RwLock::new(Some(DKGReadyState::new(setup))),
             listeners: RwLock::new(Vec::new()),
+            setup_listeners: RwLock::new(Vec::new()),
             context,
             setup_if,
             dkg_if,
@@ -87,6 +94,14 @@ impl DKGNode {
 
     pub fn add_state_change_listener(&self, listener: Box<dyn DKGStateChangeListener>) {
         self.listeners.write().unwrap().push(listener);
+    }
+
+    pub fn add_setup_change_listener(&self, listener: Box<dyn DKGSetupChangeListener>) {
+        // Also notify the listener immediately with the current setup if available.
+        if let Ok(setup) = self.state.read().unwrap().as_ref().unwrap().get_setup() {
+            listener.on_setup_changed(setup);
+        }
+        self.setup_listeners.write().unwrap().push(listener);
     }
 
     pub fn receive_qr_bytes(&self, qr_bytes: &Vec<u8>) -> Result<(), GeneralError> {
@@ -156,7 +171,7 @@ impl DKGNode {
         let res = self.do_dkg_internal(setup.clone()).await;
         // println!("{:?} DKG Complete?", self.context.friendly_name);
 
-        let _ = self.do_state_fn(|_| (DKGFinishedState::new(setup, res), Ok(())));
+        let _ = self.do_state_fn(|_| (DKGFinishedState::new(setup, res), Ok(false)));
         Ok(())
     }
 }
@@ -175,6 +190,7 @@ impl DKGNode {
         Self {
             state: RwLock::new(Some(DKGWaitForNetState::new(qr_data))),
             listeners: RwLock::new(Vec::new()),
+            setup_listeners: RwLock::new(Vec::new()),
             context,
             setup_if,
             dkg_if,
@@ -187,7 +203,16 @@ impl DKGNode {
     }
 
     pub fn receive_qr(&self, qr: QRData) -> Result<(), GeneralError> {
-        self.state.write().unwrap().as_mut().unwrap().scan_qr(qr)
+        let maybe_setup = {
+            let mut guard = self.state.write().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.scan_qr(qr)?;
+            state.get_setup().ok()
+        };
+        if let Some(setup) = maybe_setup {
+            self.notify_setup_listeners(setup);
+        }
+        Ok(())
     }
 
     // Shortcut to receive and parse a setup message.
@@ -247,22 +272,43 @@ impl DKGNode {
     // helper to do all the complicated magic of taking the state
     // out of the guard, running a function, putting it back,
     // and notifying listeners.
-    fn do_state_fn<F, O>(&self, f: F) -> Result<O, GeneralError>
+    fn do_state_fn<F>(&self, f: F) -> Result<Vec<u8>, GeneralError>
     where
         F: FnOnce(
             Box<dyn DKGInternalState>,
-        ) -> (Box<dyn DKGInternalState>, Result<O, GeneralError>),
+        ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>),
     {
-        let (old_state_enum, new_state_enum, res) = {
+        let (old_state_enum, new_state_enum, res, old_setup, new_setup) = {
             let mut guard = self.state.write().unwrap();
             let current_state = guard.take().unwrap();
             let old_state_enum = current_state.get_state();
+            let old_setup = current_state.get_setup().ok();
             let (new_state, res) = f(current_state);
             let new_state_enum = new_state.get_state();
+            let new_setup = new_state.get_setup().ok();
             *guard = Some(new_state);
-            (old_state_enum, new_state_enum, res)
+            (old_state_enum, new_state_enum, res, old_setup, new_setup)
         };
+
+        // If the state_fn indicated to send an update to the network,
+        // get the bytes here from the setup message.
+        // Need to do this first or listeners may change things.
+        let res = res.map(|send_update| {
+            if send_update {
+                new_setup.as_ref().map(|s| s.to_bytes()).unwrap_or_default()
+            } else {
+                vec![]
+            }
+        });
+
+        // Update listeners of changes.
         self.notify_listeners(old_state_enum, new_state_enum);
+        if old_setup != new_setup {
+            if let Some(setup) = new_setup {
+                self.notify_setup_listeners(setup);
+            }
+        }
+
         res
     }
 
@@ -273,6 +319,13 @@ impl DKGNode {
         let listeners = self.listeners.read().unwrap();
         for listener in listeners.iter() {
             listener.on_state_changed(old_state, new_state);
+        }
+    }
+
+    fn notify_setup_listeners(&self, setup: Arc<DKGSetupMessage>) {
+        let listeners = self.setup_listeners.read().unwrap();
+        for listener in listeners.iter() {
+            listener.on_setup_changed(setup.clone());
         }
     }
 }
@@ -319,7 +372,7 @@ impl QRData {
 }
 
 // TODO: need signatures for this.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Object)]
 pub struct DKGSetupMessage {
     pub instance: InstanceId,
     pub threshold: u8,
@@ -344,6 +397,25 @@ impl TryFrom<&str> for DKGSetupMessage {
     }
 }
 
+#[uniffi::export]
+impl DKGSetupMessage {
+    pub fn get_instance(&self) -> InstanceId {
+        self.instance
+    }
+
+    pub fn get_threshold(&self) -> u8 {
+        self.threshold
+    }
+
+    pub fn get_my_party_id(&self) -> u8 {
+        self.party_id
+    }
+
+    pub fn get_parties(&self) -> Vec<Arc<DeviceInfo>> {
+        self.parties.iter().map(|d| Arc::new(d.clone())).collect()
+    }
+}
+
 impl DKGSetupMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
@@ -355,8 +427,8 @@ impl DKGSetupMessage {
 
     fn verify_qr(&mut self, qr: &QRData) -> Result<(), GeneralError> {
         if self.instance != qr.instance
-            || self.parties.len() <= self.party_id as usize
-            || self.parties[self.party_id as usize].vk != qr.vk
+            || self.parties.len() <= qr.party_id as usize
+            || self.parties[qr.party_id as usize].vk != qr.vk
         {
             return Err(GeneralError::InvalidInput(
                 "Setup and QR mismatch".to_string(),
@@ -440,16 +512,25 @@ trait DKGInternalState: Send + Sync + 'static {
         ))
     }
 
+    // Received a setup message from the network. Handle it,
+    // and return the new state along with a result.
+    // Must always have a new state since this consumes the old state.
+    // The result is "true" to indicate that we should send an
+    // update message to the network.
     fn receive_setup_msg(
         self: Box<Self>,
         context: &DKGContext,
         setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>);
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>);
 
+    // User wants to trigger the DKG to start (not from the net!).
+    // Returns true if we should send an update message to the network.
+    // (which should be any time its successful, this is just to make
+    // it consistent with receive_setup_msg.)
     fn start_dkg(
         self: Box<Self>,
         context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>);
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>);
 
     fn get_result(&self) -> Result<Keyshare, GeneralError> {
         Err(GeneralError::InvalidState(
@@ -483,21 +564,20 @@ impl DKGInternalState for DKGWaitForNetState {
         self: Box<Self>,
         context: &DKGContext,
         mut setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         if let Err(e) = setup_msg.verify_qr(&self.qr_data) {
             return (self, Err(e));
         }
         setup_msg.add_ourself(&context.friendly_name, &context.sk);
 
         // Always have to send an update to the network.
-        let bytes_to_send = setup_msg.to_bytes();
-        (DKGReadyState::new(setup_msg), Ok(bytes_to_send))
+        (DKGReadyState::new(setup_msg), Ok(true))
     }
 
     fn start_dkg(
         self: Box<Self>,
         _context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -554,7 +634,7 @@ impl DKGInternalState for DKGReadyState {
         self: Box<Self>,
         _context: &DKGContext,
         mut setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         if let Err(e) = setup_msg.verify_existing(&self.setup) {
             return (self, Err(e));
         }
@@ -573,17 +653,17 @@ impl DKGInternalState for DKGReadyState {
                     )),
                 );
             }
-            let bytes_to_send = setup_msg.to_bytes();
-            (DKGRunningState::new(setup_msg), Ok(bytes_to_send))
+            // TODO: does this need to be true?
+            (DKGRunningState::new(Arc::new(setup_msg)), Ok(false))
         } else {
-            (Self::new(setup_msg), Ok(vec![]))
+            (Self::new(setup_msg), Ok(false))
         }
     }
 
     fn start_dkg(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _context: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         if self.setup.parties.len() < self.setup.threshold as usize {
             (
                 self,
@@ -592,10 +672,8 @@ impl DKGInternalState for DKGReadyState {
                 )),
             )
         } else {
-            let mut setup = Arc::unwrap_or_clone(self.setup);
-            setup.start = true;
-            let bytes_to_send = setup.to_bytes();
-            (DKGRunningState::new(setup), Ok(bytes_to_send))
+            Arc::make_mut(&mut self.setup).start = true;
+            (DKGRunningState::new(self.setup), Ok(true))
         }
     }
 }
@@ -610,10 +688,8 @@ struct DKGRunningState {
 }
 
 impl DKGRunningState {
-    fn new(setup: DKGSetupMessage) -> Box<Self> {
-        Box::new(Self {
-            setup: Arc::new(setup),
-        })
+    fn new(setup: Arc<DKGSetupMessage>) -> Box<Self> {
+        Box::new(Self { setup })
     }
 }
 
@@ -630,7 +706,7 @@ impl DKGInternalState for DKGRunningState {
         self: Box<Self>,
         _context: &DKGContext,
         _setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -642,7 +718,7 @@ impl DKGInternalState for DKGRunningState {
     fn start_dkg(
         self: Box<Self>,
         _: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -689,7 +765,7 @@ impl DKGInternalState for DKGFinishedState {
         self: Box<Self>,
         _context: &DKGContext,
         _setup_msg: DKGSetupMessage,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
@@ -701,7 +777,7 @@ impl DKGInternalState for DKGFinishedState {
     fn start_dkg(
         self: Box<Self>,
         _: &DKGContext,
-    ) -> (Box<dyn DKGInternalState>, Result<Vec<u8>, GeneralError>) {
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         (
             self,
             Err(GeneralError::InvalidState(
