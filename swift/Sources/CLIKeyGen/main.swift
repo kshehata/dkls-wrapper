@@ -143,7 +143,7 @@ if dkgArgs.qrData.isEmpty {
         let instanceStr = hexString(qr.getInstance().toBytes())
         let setupInterface = getMQTTInterface(instanceStr, "setup")
         let dkgInterface = getMQTTInterface(instanceStr, "proto")
-        dkgNode = try DkgNode.fromQr(
+        dkgNode = DkgNode.fromQr(
             name: dkgArgs.name, qrData: qr,
             setupIf: setupInterface,
             dkgIf: dkgInterface)
@@ -170,9 +170,20 @@ final class SetupChangeListener: DkgSetupChangeListener, @unchecked Sendable {
         // print("Instance: \(hexString(setup.getInstance().toBytes()))")
         print("Threshold: \(setup.getThreshold())")
         print("Parties (\(parties.count)):")
+        let myIndex = setup.getMyPartyId()
         for (i, party) in parties.enumerated() {
-            let verified = party.isVerified() ? " (Verified)" : ""
-            let mark = party.isVerified() ? "✓" : "?"  // u2713
+            let verified: String
+            let mark: String
+            if i == myIndex {
+                verified = " (this device)"
+                mark = "•"
+            } else if party.isVerified() {
+                verified = " (Verified)"
+                mark = "✓"
+            } else {
+                verified = ""
+                mark = "?"
+            }
             print("  \(i + 1). \(mark) \(party.name())\(verified)")
         }
         print(colorize("------------------------", .magenta) + "\n")
@@ -188,6 +199,14 @@ final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
 
     func onStateChanged(oldState: DkgState, newState: DkgState) {
         print(colorize("State changed: \(oldState) -> \(newState)", .cyan))
+        if oldState == .waitForSetup && (newState == .waitForParties || newState == .ready) {
+            do {
+                try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))
+            } catch {
+                // Should never happen at this point.
+                print(colorize("Error getting QR data: \(error)", .red))
+            }
+        }
         if newState == .running {
             inputTask?.cancel()
         }
@@ -196,16 +215,26 @@ final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
 
 var inputTask = Task.detached {
     while true {
-        let line = readLine()
-        if line == "q" || line == "quit" {
+        guard let line = readLine() else {
             print(colorize("Exiting...", .red))
-            exit(0)
+            exit(1)
         }
-        if line == "start" || line == "s" {
+        if line.isEmpty {
             if dkgNode.getState() == .ready {
                 break
             } else {
-                print(colorize("Not ready yet. Try again.", .yellow))
+                print(colorize("Not ready yet.", .yellow))
+            }
+        } else {
+            // Assume this is QR data
+            guard let qrData = Data(base64Encoded: line) else {
+                print(colorize("QR Data has invalid Base 64 encoding", .red))
+                continue
+            }
+            do {
+                try dkgNode.receiveQrBytes(qrBytes: qrData)
+            } catch {
+                print(colorize("Error in QR data: \(error)", .red))
             }
         }
     }
