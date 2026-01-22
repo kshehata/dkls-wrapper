@@ -10,6 +10,8 @@
 
 - Install **Rust** with [`rustup`](https://rustup.rs/)
 - Install Android Studio and create a new project.
+
+#### 1.1. Android Project
 - Install **Android NDK** via Android Studio (SDK Manager → SDK Tools → "NDK")
 - Set `ANDROID_NDK_HOME` to your NDK path (Needed for `build-kotlin.sh`):
 ```
@@ -29,15 +31,32 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 cargo install uniffi --features cli
 ```
 
-### 2. Build the Kotlin Bindings for `dkls-wrapper`
-- Run `build-kotlin.sh` from the Repo's Root dir.
-- You will see under `kotlin/` that the `src/main/java` and `src/main/jniLibs` are available, which you can then add as dependency for the Android App project.
+#### 1.2. Kotlin CLI (Lightweight)
+- Install **uniffi** crate:
 ```
-==> Done.
-Kotlin bindings generated into: kotlin/src/main/java
-Android .so libraries generated into: kotlin/src/main/jniLibs
+cargo install uniffi --features cli
+```
+- Install JDK and ensure `java -version` works.
+- Install **gradle** 9.3.0 (or newer):
+```
+sdk install gradle 9.3.0
+```
 
-Next steps:
-  - Add the kotlin module as a dependency of your app.
-  - Call System.loadLibrary("dkls") before using the generated Kotlin classes.
+### 2. Build the Kotlin Bindings for `dkls-wrapper`
+- **\[OPTIONAL\]** Install [KTLint](https://pinterest.github.io/ktlint/latest/install/cli/) for formatting, or ignore the warnings during build
+- Run `build-kotlin.sh` from the Repo's Root dir.
+- You will see under `kotlin/` that the `src/main/java` and `src/main/jniLibs` are available, which you can then add as dependency for the Android App project. (End of documentation for Android App)
 ```
+==> Building Rust shared library for host
+    Finished `release` profile [optimized] target(s) in 0.15s
+==> Copying native library into Kotlin resources
+==> Cleaning old generated Kotlin bindings
+==> Generating Kotlin bindings with uniffi-bindgen
+Code generation complete, formatting with ktlint (use --no-format to disable)
+==> Done
+Kotlin bindings: kotlin/src/main/kotlin
+Native library:  kotlin/src/main/resources/native
+```
+
+### 3. Running the Kotlin Program using Gradle
+- Run `gradlew run` within your CLI, located within the `kotlin/`, to run the application.
