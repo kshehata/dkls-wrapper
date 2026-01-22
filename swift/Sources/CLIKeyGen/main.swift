@@ -94,16 +94,12 @@ do {
     exit(1)
 }
 
-print(colorize("👂 Listening for messages...", .yellow))
-let setupInterface = MQTTInterface(
-    client: client,
-    topic: "dkg_setup/"
-)
-
-let dkgInterface = MQTTInterface(
-    client: client,
-    topic: "dkg/"
-)
+func getMQTTInterface(_ instanceStr: String, _ sub: String) -> MQTTInterface {
+    return MQTTInterface(
+        client: client,
+        topic: "dkg/\(instanceStr)/\(sub)"
+    )
+}
 
 let dkgNode: DkgNode
 if dkgArgs.qrData.isEmpty {
@@ -118,7 +114,10 @@ if dkgArgs.qrData.isEmpty {
             exit(1)
         }
     }
+    print(colorize("👂 Listening for messages...", .yellow))
     let instanceStr = hexString(instanceID.toBytes())
+    let setupInterface = getMQTTInterface(instanceStr, "setup")
+    let dkgInterface = getMQTTInterface(instanceStr, "proto")
     print(
         colorize(
             "Starting DKG as starter for instance \(instanceStr), threshold \(dkgArgs.threshold)",
@@ -139,8 +138,12 @@ if dkgArgs.qrData.isEmpty {
 } else {
     print(colorize("Starting DKG as participant for QR data \(dkgArgs.qrData)", .yellow))
     do {
-        dkgNode = try DkgNode.tryFromQrBytes(
-            name: dkgArgs.name, qrBytes: Data(base64Encoded: dkgArgs.qrData)!,
+        let qr = try QrData.fromBytes(bytes: Data(base64Encoded: dkgArgs.qrData)!)
+        let instanceStr = hexString(qr.getInstance().toBytes())
+        let setupInterface = getMQTTInterface(instanceStr, "setup")
+        let dkgInterface = getMQTTInterface(instanceStr, "proto")
+        dkgNode = try DkgNode.fromQr(
+            name: dkgArgs.name, qrData: qr,
             setupIf: setupInterface,
             dkgIf: dkgInterface)
     } catch {

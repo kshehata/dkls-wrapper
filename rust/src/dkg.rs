@@ -74,6 +74,28 @@ impl DKGNode {
     }
 
     #[uniffi::constructor]
+    pub fn from_qr(
+        name: &str,
+        qr_data: Arc<QRData>,
+        setup_if: Arc<dyn NetworkInterface>,
+        dkg_if: Arc<dyn NetworkInterface>,
+    ) -> Self {
+        let context = DKGContext {
+            friendly_name: name.to_string(),
+            sk: NodeSecretKey::from_entropy(),
+        };
+        Self {
+            state: RwLock::new(Some(DKGWaitForNetState::new(qr_data))),
+            listeners: RwLock::new(Vec::new()),
+            setup_listeners: RwLock::new(Vec::new()),
+            context,
+            setup_if,
+            dkg_if,
+            await_msg_kick: Notify::new(),
+        }
+    }
+
+    #[uniffi::constructor]
     pub fn try_from_qr_bytes(
         name: &str,
         qr_bytes: &Vec<u8>,
@@ -81,7 +103,7 @@ impl DKGNode {
         dkg_if: Arc<dyn NetworkInterface>,
     ) -> Result<Self, GeneralError> {
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
-        Ok(Self::from_qr(name, qr_data, setup_if, dkg_if))
+        Ok(Self::from_qr(name, Arc::new(qr_data), setup_if, dkg_if))
     }
 
     pub fn get_qr_bytes(&self) -> Result<Vec<u8>, GeneralError> {
@@ -177,27 +199,6 @@ impl DKGNode {
 }
 
 impl DKGNode {
-    pub fn from_qr(
-        name: &str,
-        qr_data: QRData,
-        setup_if: Arc<dyn NetworkInterface>,
-        dkg_if: Arc<dyn NetworkInterface>,
-    ) -> Self {
-        let context = DKGContext {
-            friendly_name: name.to_string(),
-            sk: NodeSecretKey::from_entropy(),
-        };
-        Self {
-            state: RwLock::new(Some(DKGWaitForNetState::new(qr_data))),
-            listeners: RwLock::new(Vec::new()),
-            setup_listeners: RwLock::new(Vec::new()),
-            context,
-            setup_if,
-            dkg_if,
-            await_msg_kick: Notify::new(),
-        }
-    }
-
     pub fn get_qr(&self) -> Result<QRData, GeneralError> {
         self.state.read().unwrap().as_ref().unwrap().get_qr()
     }
@@ -336,7 +337,7 @@ impl DKGNode {
 
 // QR Code data for setting up DKG.
 // TODO: hash of setup or signature ?
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, uniffi::Object)]
 pub struct QRData {
     // TODO: should make all of these read-only.
     pub instance: InstanceId,
@@ -361,13 +362,36 @@ impl TryFrom<&str> for QRData {
     }
 }
 
+#[uniffi::export]
 impl QRData {
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Arc<QRData>, GeneralError> {
+        Ok(Arc::new(Self::try_from(bytes)?))
+    }
+
+    #[uniffi::constructor]
+    pub fn from_string(s: &str) -> Result<Arc<QRData>, GeneralError> {
+        Ok(Arc::new(Self::try_from(s)?))
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
     }
 
     pub fn to_string(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    pub fn get_instance(&self) -> InstanceId {
+        self.instance
+    }
+
+    pub fn get_party_id(&self) -> u8 {
+        self.party_id
+    }
+
+    pub fn get_vk(&self) -> NodeVerifyingKey {
+        self.vk.clone()
     }
 }
 
@@ -546,11 +570,11 @@ trait DKGInternalState: Send + Sync + 'static {
  *****************************************************************************/
 
 struct DKGWaitForNetState {
-    qr_data: QRData,
+    qr_data: Arc<QRData>,
 }
 
 impl DKGWaitForNetState {
-    fn new(qr_data: QRData) -> Box<Self> {
+    fn new(qr_data: Arc<QRData>) -> Box<Self> {
         Box::new(Self { qr_data })
     }
 }
@@ -845,7 +869,7 @@ mod tests {
 
         assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
 
-        let qr = nodes[0].get_qr().unwrap();
+        let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
         assert_eq!(qr.party_id, 0);
         // TODO: check vk
