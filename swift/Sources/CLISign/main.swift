@@ -26,6 +26,9 @@ struct SignArgs: ParsableCommand {
     @Option(name: .shortAndLong, help: "Message to sign.")
     var message: String = ""
 
+    @Flag(name: .customShort("y"), help: "Assume yes for any confirmation prompts.")
+    var skipConfirmation = false
+
     @Option(name: .long, help: "MQTT host.")
     var mqttHost: String = "localhost"
 
@@ -92,10 +95,14 @@ if signArgs.message.isEmpty {
             print("InstanceID: \(hexString(req.instance().toBytes()))")
             print("Message:")
             print(String(data: req.message(), encoding: .utf8)!)
-            print("Approve? [y/N]")
-            let approval = readLine()!
-            if approval.lowercased() != "y" {
-                continue
+            if signArgs.skipConfirmation {
+                print("Skipping confirmation")
+            } else {
+                print("Approve? [y/N]")
+                let approval = readLine()!
+                if approval.lowercased() != "y" {
+                    continue
+                }
             }
             let message = req.message()
             let sig = try await signNode.doJoinRequest(req: req, netIf: netInterface)
