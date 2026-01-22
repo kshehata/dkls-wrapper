@@ -97,7 +97,8 @@ do {
 func getMQTTInterface(_ instanceStr: String, _ sub: String) -> MQTTInterface {
     return MQTTInterface(
         client: client,
-        topic: "dkg/\(instanceStr)/\(sub)"
+        topic: "dkg/\(instanceStr)/\(sub)",
+        retainOnSend: true,
     )
 }
 
