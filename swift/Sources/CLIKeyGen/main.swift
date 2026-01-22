@@ -159,12 +159,35 @@ var messageLoopTask = Task {
     print(colorize("Message loop completed.", .magenta))
 }
 
-// TODO: This should wait until we're in the ready state.
-await Task.detached {
-    print(colorize("Waiting for parties. Type start to send start message.", .magenta))
-    let line = readLine()
-    if line != "start" {
-        return
+final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
+    let inputTask: Task<Void, Never>?
+
+    init(inputTask: Task<Void, Never>?) {
+        self.inputTask = inputTask
+    }
+
+    func onStateChanged(oldState: DkgState, newState: DkgState) {
+        print(colorize("State changed: \(oldState) -> \(newState)", .cyan))
+        if newState == .running {
+            inputTask?.cancel()
+        }
+    }
+}
+
+var inputTask = Task.detached {
+    while true {
+        let line = readLine()
+        if line == "q" || line == "quit" {
+            print(colorize("Exiting...", .red))
+            exit(0)
+        }
+        if line == "start" || line == "s" {
+            if dkgNode.getState() == .ready {
+                break
+            } else {
+                print(colorize("Not ready yet. Try again.", .yellow))
+            }
+        }
     }
     print(colorize("Starting DKG", .yellow))
     do {
@@ -173,7 +196,10 @@ await Task.detached {
         print(colorize("Error starting DKG: \(error)", .red))
         exit(1)
     }
-}.value
+}
+
+let listener = StateChangeListener(inputTask: inputTask)
+dkgNode.addStateChangeListener(listener: listener)
 
 print(colorize("Waiting for DKG to complete...", .yellow))
 await messageLoopTask.value
