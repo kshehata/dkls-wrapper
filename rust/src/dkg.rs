@@ -4,7 +4,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use signature::Signer;
-use sl_dkls23::setup;
+
 use tokio::sync::Notify;
 
 use sl_dkls23::keygen::run as keygen_run;
@@ -63,7 +63,7 @@ impl DKGNode {
             start: false,
         };
         Self {
-            state: RwLock::new(Some(DKGReadyState::new(setup, 0))),
+            state: RwLock::new(Some(DKGReadyState::new(setup.into(), 0))),
             listeners: RwLock::new(Vec::new()),
             setup_listeners: RwLock::new(Vec::new()),
             context,
@@ -104,6 +104,10 @@ impl DKGNode {
     ) -> Result<Self, GeneralError> {
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
         Ok(Self::from_qr(name, Arc::new(qr_data), setup_if, dkg_if))
+    }
+
+    pub fn get_name(&self) -> String {
+        self.context.friendly_name.clone()
     }
 
     pub fn get_qr_bytes(&self) -> Result<Vec<u8>, GeneralError> {
@@ -240,6 +244,14 @@ impl DKGNode {
             self.setup_if.send(bytes_to_send).await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn test_handle_setup_msg(
+        &self,
+        setup_msg: SignedDKGSetupMessage,
+    ) -> Result<Vec<u8>, GeneralError> {
+        self.do_state_fn(|state| state.receive_setup_msg(&self.context, setup_msg))
     }
 
     async fn do_dkg_internal(
@@ -467,39 +479,31 @@ impl DKGSetupMessage {
     }
 
     fn add_ourself(&mut self, name: &str, sk: &NodeSecretKey) -> u8 {
-        self.parties.push(DeviceInfo::for_sk(name.to_string(), sk));
+        let mut device = DeviceInfo::for_sk(name.to_string(), sk);
+        device.verified = true;
+        self.parties.push(device);
         self.parties.len() as u8 - 1
     }
 
-    // NB: self is the NEW setup message.
-    // This checks that the new setup message is consistent with the existing setup message.
-    fn verify_existing(
-        &mut self,
-        existing_setup: &DKGSetupMessage,
-    ) -> Result<&mut Self, GeneralError> {
-        // Make sure setup is consistent.
-        if existing_setup.instance != self.instance
-            || existing_setup.threshold != self.threshold
-            || existing_setup.parties.len() > self.parties.len()
+    fn is_prefix_of(&self, new_setup: &DKGSetupMessage) -> bool {
+        // Make sure basics are consistent and at least as many parties.
+        if new_setup.instance != self.instance
+            || new_setup.threshold != self.threshold
+            || new_setup.parties.len() < self.parties.len()
         {
-            return Err(GeneralError::InvalidSetupMessage);
+            return false;
         }
 
-        // Copy the verified field from the existing setup message.
-        for i in 0..existing_setup.parties.len() {
-            self.parties[i].verified = existing_setup.parties[i].verified;
-        }
-
-        // If any of the device infos are different, reject the setup.
-        if self.parties[..existing_setup.parties.len()] != existing_setup.parties {
-            return Err(GeneralError::InvalidSetupMessage);
-        }
-        Ok(self)
+        // Check that VKs and friendly names are the same.
+        self.parties
+            .iter()
+            .zip(new_setup.parties.iter())
+            .all(|(a, b)| (a.vk == b.vk) && (a.friendly_name == b.friendly_name))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Object)]
-struct SignedDKGSetupMessage {
+pub struct SignedDKGSetupMessage {
     setup: Arc<DKGSetupMessage>,
     party_id: u8,
     sig: Signature,
@@ -544,12 +548,21 @@ impl SignedDKGSetupMessage {
     }
 
     pub fn verify(&self) -> Result<(), GeneralError> {
-        if self.party_id >= self.setup.parties.len() as u8 {
+        Self::verify_for_setup(&self.setup, self.party_id as usize, &self.sig)
+    }
+
+    // Helper to verify a signature without constructing a SignedDKGSetupMessage.
+    pub fn verify_for_setup(
+        setup: &DKGSetupMessage,
+        party_id: usize,
+        sig: &Signature,
+    ) -> Result<(), GeneralError> {
+        if party_id >= setup.parties.len() {
             return Err(GeneralError::InvalidInput("Invalid party ID".to_string()));
         }
-        self.setup.parties[self.party_id as usize]
+        setup.parties[party_id]
             .vk
-            .verify(self.setup.to_bytes().as_ref(), &self.sig)
+            .verify(setup.to_bytes().as_ref(), sig)
     }
 }
 
@@ -560,6 +573,7 @@ impl SignedDKGSetupMessage {
 #[derive(Debug, PartialEq, Clone, Copy, uniffi::Enum)]
 pub enum DKGState {
     WaitForSetup,
+    WaitForSigs,
     WaitForParties,
     Ready,
     Running,
@@ -665,10 +679,9 @@ impl DKGInternalState for DKGWaitForNetState {
         if let Err(e) = setup.verify_qr(&self.qr_data) {
             return (self, Err(e));
         }
-        let party_id = setup.add_ourself(&context.friendly_name, &context.sk);
 
         // Always have to send an update to the network.
-        (DKGReadyState::new(setup, party_id), Ok(true))
+        (DKGWaitForSigs::join(setup, context), Ok(true))
     }
 
     fn start_dkg(
@@ -679,6 +692,142 @@ impl DKGInternalState for DKGWaitForNetState {
             self,
             Err(GeneralError::InvalidState(
                 "Cannot start from current state.".to_string(),
+            )),
+        )
+    }
+}
+
+/*****************************************************************************
+ * Wait for Signatures state.
+ * In this state, we have proposed a setup and we are waiting for everyone
+ * else to sign it.
+ *****************************************************************************/
+
+struct DKGWaitForSigs {
+    setup: Arc<DKGSetupMessage>,
+    party_id: u8,
+    signatures: Vec<Option<Signature>>,
+}
+
+impl DKGWaitForSigs {
+    // INTERNAL ONLY: make a new state with only our signature.
+    fn new(setup: Arc<DKGSetupMessage>, party_id: u8, sk: &NodeSecretKey) -> Box<Self> {
+        let num_parties = setup.parties.len();
+        let mut state = Box::new(Self {
+            setup,
+            party_id,
+            signatures: vec![None; num_parties],
+        });
+        // Sign the proposal ourselves.
+        let msg = SignedDKGSetupMessage::sign(state.setup.clone(), party_id, sk);
+        state.add_signature(party_id, msg.sig);
+        state
+    }
+
+    // Join an existing DKG setup for info.
+    fn join(mut setup: DKGSetupMessage, context: &DKGContext) -> Box<Self> {
+        let party_id = setup.add_ourself(&context.friendly_name, &context.sk);
+        Self::new(Arc::new(setup), party_id, &context.sk)
+    }
+
+    // We've received a setup message for another party joining.
+    fn for_setup_msg(
+        setup_msg: SignedDKGSetupMessage,
+        party_id: u8,
+        context: &DKGContext,
+    ) -> Box<Self> {
+        let mut state = Self::new(setup_msg.setup, party_id, &context.sk);
+        state.add_signature(setup_msg.party_id, setup_msg.sig);
+        state
+    }
+
+    fn add_signature(&mut self, party_id: u8, sig: Signature) {
+        if (party_id as usize) < self.signatures.len() {
+            self.signatures[party_id as usize] = Some(sig);
+        }
+    }
+
+    fn has_all_signatures(&self) -> bool {
+        self.signatures.iter().all(|s| s.is_some())
+    }
+}
+
+impl DKGInternalState for DKGWaitForSigs {
+    fn get_state(&self) -> DKGState {
+        DKGState::WaitForSigs
+    }
+
+    fn my_party_id(&self) -> Result<u8, GeneralError> {
+        Ok(self.party_id)
+    }
+
+    fn get_qr(&self) -> Result<QRData, GeneralError> {
+        Ok(QRData {
+            instance: self.setup.instance,
+            party_id: self.party_id,
+            vk: self.setup.parties[self.party_id as usize].vk.clone(),
+        })
+    }
+
+    fn get_setup(&self) -> Result<Arc<DKGSetupMessage>, GeneralError> {
+        Ok(self.setup.clone())
+    }
+
+    // TODO: can we get the signature from our saved set?
+    fn get_signed_setup(
+        &self,
+        context: &DKGContext,
+    ) -> Result<SignedDKGSetupMessage, GeneralError> {
+        Ok(SignedDKGSetupMessage::sign(
+            self.setup.clone(),
+            self.party_id,
+            &context.sk,
+        ))
+    }
+
+    fn scan_qr(&mut self, qr_data: QRData) -> Result<(), GeneralError> {
+        Arc::make_mut(&mut self.setup).verify_qr(&qr_data)
+    }
+
+    fn receive_setup_msg(
+        mut self: Box<Self>,
+        _context: &DKGContext,
+        setup_msg: SignedDKGSetupMessage,
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+        // Check if setup matches (ignoring verified flags).
+        if !self.setup.is_prefix_of(&setup_msg.setup)
+            || setup_msg.setup.parties.len() != self.setup.parties.len()
+        {
+            return (self, Err(GeneralError::InvalidSetupMessage));
+        }
+
+        // DKGNode should have verified the message and sig before
+        // getting here so signer ID must be valid.
+        self.add_signature(setup_msg.party_id, setup_msg.sig);
+
+        // Check if everyone has signed.
+        // TODO: get rid of the clone below.
+        if self.has_all_signatures() {
+            // TODO: this is unnecessary, but helpful for testing. Remove it before deploying.
+            assert!(self.signatures.iter().enumerate().all(|(i, s)| {
+                s.is_some()
+                    && SignedDKGSetupMessage::verify_for_setup(&self.setup, i, s.as_ref().unwrap())
+                        .is_ok()
+            }));
+            (DKGReadyState::new(self.setup, self.party_id), Ok(false))
+        } else {
+            (self, Ok(false))
+        }
+    }
+
+    fn start_dkg(
+        self: Box<Self>,
+        _context: &DKGContext,
+    ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
+        (
+            self,
+            Err(GeneralError::InvalidState(
+                "Cannot start while waiting for signatures.".to_string(),
             )),
         )
     }
@@ -696,11 +845,8 @@ struct DKGReadyState {
 }
 
 impl DKGReadyState {
-    fn new(setup: DKGSetupMessage, party_id: u8) -> Box<Self> {
-        Box::new(Self {
-            setup: Arc::new(setup),
-            party_id,
-        })
+    fn new(setup: Arc<DKGSetupMessage>, party_id: u8) -> Box<Self> {
+        Box::new(Self { setup, party_id })
     }
 }
 
@@ -749,47 +895,27 @@ impl DKGInternalState for DKGReadyState {
         _context: &DKGContext,
         mut setup_msg: SignedDKGSetupMessage,
     ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
-        let mut new_setup = Arc::unwrap_or_clone(setup_msg.setup);
-
-        // This gets a little complicated with signatures.
-        // Normal cases: all of the previous parties match.
-        //  -> Due to network reordering, can take any sig
-        //     (i.e. might get sig from actual party after
-        //     some other party)
-        //   In this case add the new parties and collect sigs.
-        //
-        // Reordering case: if we get some other order,
-        // only accept it if it's signed by *our* previous
-        // party ID 0.
-        // Should also check that we didn't previously receive
-        // a different prefix, i.e. ID 0 can't equivocate.
-
         // Make sure setup is consistent.
-        if self.setup.instance != new_setup.instance
-            || self.setup.threshold != new_setup.threshold
-            || self.setup.parties.len() > new_setup.parties.len()
-        {
+        if !self.setup.is_prefix_of(&setup_msg.setup) {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
+
+        let new_setup = Arc::make_mut(&mut setup_msg.setup);
 
         // Copy the verified field from the existing setup message.
         for i in 0..self.setup.parties.len() {
             new_setup.parties[i].verified = self.setup.parties[i].verified;
         }
 
-        // If any of the device infos are different, reject the setup.
-        if new_setup.parties[..self.setup.parties.len()] != self.setup.parties {
-            return (self, Err(GeneralError::InvalidSetupMessage));
-        }
-
         // Check if we got the start flag, and if so
         // check that we have enough parties to start.
         if new_setup.start {
+            // TODO: This start logic probably needs to be updated.
             // println!("{} received start flag", _context.friendly_name);
             if new_setup.parties.len() < new_setup.threshold as usize {
                 new_setup.start = false;
                 return (
-                    Self::new(new_setup, self.party_id),
+                    Self::new(setup_msg.setup, self.party_id),
                     Err(GeneralError::InvalidState(
                         "Not enough parties to start DKG.".to_string(),
                     )),
@@ -797,11 +923,20 @@ impl DKGInternalState for DKGReadyState {
             }
             // TODO: does this need to be true?
             (
-                DKGRunningState::new(Arc::new(new_setup), self.party_id),
+                DKGRunningState::new(setup_msg.setup, self.party_id),
                 Ok(false),
             )
+
+        // Special case: if we're the first party and a second party joins,
+        // then we already have both signatures so can skip this.
+        } else if new_setup.parties.len() > self.setup.parties.len() && self.setup.parties.len() > 1
+        {
+            (
+                DKGWaitForSigs::for_setup_msg(setup_msg, self.party_id, &_context),
+                Ok(true),
+            )
         } else {
-            (Self::new(new_setup, self.party_id), Ok(false))
+            (Self::new(setup_msg.setup, self.party_id), Ok(true))
         }
     }
 
@@ -973,37 +1108,80 @@ impl DKGInternalState for DKGFinishedState {
 mod tests {
     use super::*;
     use crate::net::InMemoryBridge;
-    use k256::elliptic_curve::group::GroupEncoding;
+
     use std::time::Duration;
-    use tokio::time::sleep;
+    use tokio::sync::watch;
+    use tokio::time::timeout;
 
     fn spawn_node(
         js: &mut tokio::task::JoinSet<()>,
         node: Arc<DKGNode>,
     ) -> tokio::task::AbortHandle {
         js.spawn(async move {
-            let _ = node.message_loop().await;
+            let res = node.message_loop().await;
+            println!("Node {} finished with result: {:?}", node.get_name(), res);
         })
     }
 
-    async fn wait_for_state(node: Arc<DKGNode>, state: DKGState, iters: u64) -> bool {
-        for _ in 0..iters {
-            // println!(
-            //     "{} is in state {:?}",
-            //     node.context.friendly_name,
-            //     node.get_state()
-            // );
-            if node.get_state() == state {
+    struct DKGStateReceiver {
+        rx: watch::Receiver<DKGState>,
+    }
+
+    impl DKGStateReceiver {
+        fn watch_node(node: &DKGNode) -> Self {
+            let (tx, rx) = watch::channel(node.get_state());
+            let listener = AsyncStateListener {
+                tx,
+                debug_name: node.get_name(),
+            };
+            node.add_state_change_listener(Box::new(listener));
+            Self { rx }
+        }
+
+        async fn wait_for_state(&mut self, target: DKGState, timeout_ms: u64) -> bool {
+            if *self.rx.borrow() == target {
                 return true;
             }
-            sleep(Duration::from_millis(10)).await;
+            let result = timeout(Duration::from_millis(timeout_ms), async {
+                while self.rx.changed().await.is_ok() {
+                    if *self.rx.borrow() == target {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await;
+
+            match result {
+                Ok(v) => v,
+                Err(_) => {
+                    println!("Timeout waiting for state {:?}", target);
+                    false
+                }
+            }
         }
-        false
+    }
+
+    struct AsyncStateListener {
+        tx: watch::Sender<DKGState>,
+        debug_name: String,
+    }
+
+    impl DKGStateChangeListener for AsyncStateListener {
+        fn on_state_changed(&self, _old: DKGState, new: DKGState) {
+            if !self.debug_name.is_empty() {
+                println!(
+                    "{} saw state change from {:?} to {:?}",
+                    self.debug_name, _old, new
+                );
+            }
+            let _ = self.tx.send(new);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_dkg_node() {
-        println!("Starting DKG Node Test");
+    async fn test_dkg_node_2_parties() {
+        println!("Starting DKG Node 2 Party Test");
         let instance = InstanceId::from_entropy();
 
         let setup_coord = InMemoryBridge::new();
@@ -1030,86 +1208,30 @@ mod tests {
             setup_coord.connect(),
             dkg_coord.connect(),
         )));
+
         assert_eq!(nodes[1].get_state(), DKGState::WaitForSetup);
+
+        let mut state_watchers = nodes
+            .iter()
+            .map(|n| DKGStateReceiver::watch_node(n))
+            .collect::<Vec<_>>();
 
         let mut parties = tokio::task::JoinSet::new();
         spawn_node(&mut parties, nodes[1].clone());
         spawn_node(&mut parties, nodes[0].clone());
 
         // Wait for both nodes to become ready.
-        assert!(wait_for_state(nodes[1].clone(), DKGState::Ready, 50).await);
-        assert!(wait_for_state(nodes[0].clone(), DKGState::Ready, 50).await);
+        for watcher in &mut state_watchers {
+            assert!(watcher.wait_for_state(DKGState::Ready, 500).await);
+        }
 
         assert!(nodes[0].start_dkg().await.is_ok());
         // assert!(nodes[1].start_dkg().await.is_ok());
 
         // Wait for both nodes to finish DKG.
-        assert!(wait_for_state(nodes[1].clone(), DKGState::Finished, 500).await);
-        assert!(wait_for_state(nodes[0].clone(), DKGState::Finished, 500).await);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_state_listener() {
-        struct TestListener {
-            changes: Arc<RwLock<Vec<(DKGState, DKGState)>>>,
+        for watcher in &mut state_watchers {
+            assert!(watcher.wait_for_state(DKGState::Finished, 2000).await);
         }
-
-        impl DKGStateChangeListener for TestListener {
-            fn on_state_changed(&self, old: DKGState, new: DKGState) {
-                self.changes.write().unwrap().push((old, new));
-            }
-        }
-
-        let changes = Arc::new(RwLock::new(Vec::new()));
-        let listener = TestListener {
-            changes: changes.clone(),
-        };
-
-        let instance = InstanceId::from_entropy();
-        let setup_if = InMemoryBridge::new();
-        let dkg_if = InMemoryBridge::new();
-        let other_conn = setup_if.connect();
-
-        let node = Arc::new(DKGNode::new(
-            "ListenerNode",
-            &instance,
-            2,
-            setup_if.connect(),
-            dkg_if.connect(),
-        ));
-
-        node.add_state_change_listener(Box::new(listener));
-
-        let node_ref = node.clone();
-        tokio::spawn(async move {
-            let _ = node_ref.message_loop().await;
-        });
-
-        // 1. Receive the initial setup message (broadcast by node).
-        // It broadcasts because it starts in WaitForParties (1 < 2).
-        let received_bytes = other_conn.receive().await.unwrap();
-        let mut setup_msg = DKGSetupMessage::try_from(received_bytes.as_slice()).unwrap();
-
-        // 2. Add another party to it.
-        let other_sk = NodeSecretKey::from_entropy();
-        let other_id = setup_msg.add_ourself("OtherNode", &other_sk);
-
-        // 3. Send it back.
-        let signed_msg = SignedDKGSetupMessage::sign(Arc::new(setup_msg), other_id, &other_sk);
-        other_conn.send(signed_msg.to_bytes()).await.unwrap();
-
-        // 4. Wait for state change to Ready.
-        assert!(wait_for_state(node.clone(), DKGState::Ready, 50).await);
-
-        let changes_vec = changes.read().unwrap();
-        // We expect at least one transition to Ready.
-        // Depending on timing, we might see intermediate states if any (none here).
-        // Transition: WaitForParties -> Ready.
-        assert!(!changes_vec.is_empty());
-        assert_eq!(
-            changes_vec.last().unwrap(),
-            &(DKGState::WaitForParties, DKGState::Ready)
-        );
     }
 
     fn make_sample_setup(t: u8, n: u8) -> (Arc<DKGSetupMessage>, Vec<Arc<NodeSecretKey>>) {
@@ -1161,7 +1283,7 @@ mod tests {
     fn test_ready_receive_setup_consistency_mismatched_instance() {
         let (setup, _) = make_sample_setup(2, 3);
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let mut bad_setup = (*setup).clone();
@@ -1176,7 +1298,7 @@ mod tests {
     fn test_ready_receive_setup_consistency_mismatched_threshold() {
         let (setup, _) = make_sample_setup(2, 3);
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let mut bad_setup = (*setup).clone();
@@ -1191,7 +1313,7 @@ mod tests {
     fn test_ready_receive_setup_consistency_incompatible_party_list_shorter() {
         let (setup, _) = make_sample_setup(2, 3);
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let mut bad_setup = (*setup).clone();
@@ -1206,7 +1328,7 @@ mod tests {
     fn test_ready_receive_setup_consistency_incompatible_party_list_different() {
         let (setup, _) = make_sample_setup(2, 3);
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let (setup2, _) = make_sample_setup(2, 3);
@@ -1224,7 +1346,7 @@ mod tests {
         let extra_party = partial_setup.parties.pop().unwrap();
 
         let party_id = 0;
-        let ready_state = DKGReadyState::new(partial_setup.clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         // Receive full setup
@@ -1242,7 +1364,7 @@ mod tests {
     fn test_ready_receive_setup_start_not_enough_parties() {
         let (setup, _) = make_sample_setup(3, 2); // Threshold 3, but only 2 parties
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let mut start_setup = (*setup).clone();
@@ -1263,7 +1385,7 @@ mod tests {
     fn test_ready_receive_setup_start_success() {
         let (setup, _) = make_sample_setup(2, 2); // Threshold 2, 2 parties (enough)
         let party_id = 0;
-        let ready_state = DKGReadyState::new((*setup).clone(), party_id);
+        let ready_state = DKGReadyState::new(setup.clone(), party_id);
         let ctx = make_test_context();
 
         let mut start_setup = (*setup).clone();
@@ -1295,7 +1417,7 @@ mod tests {
         let (new_state, res) = boxed_state.receive_setup_msg(&ctx, msg);
 
         assert!(res.is_ok());
-        assert_eq!(new_state.get_state(), DKGState::Ready);
+        assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
         let new_setup = new_state.get_setup().unwrap();
         // Should have added ourselves
         assert_eq!(new_setup.parties.len(), setup.parties.len() + 1);
@@ -1370,9 +1492,163 @@ mod tests {
         let (setup, _) = make_sample_setup(2, 3);
         let finished_state = DKGFinishedState::new(setup.clone(), Err(GeneralError::Cancelled), 0);
         let ctx = make_test_context();
-
         let boxed_state: Box<dyn DKGInternalState> = finished_state;
         let (_, res) = boxed_state.start_dkg(&ctx);
         assert!(matches!(res, Err(GeneralError::InvalidState(_))));
+    }
+
+    #[test]
+    fn test_join_wait_for_sigs() {
+        // 1. Initial Setup with 2 parties (Node 1 and Node 2)
+        let (setup, party_sks) = make_sample_setup(2, 2);
+
+        // 2. Create Node 3 (Joining)
+        // Mimic scanning QR from Node 1 (party 0)
+        let qr = QRData {
+            instance: setup.instance,
+            party_id: 0,
+            vk: setup.parties[0].vk.clone(),
+        };
+
+        let setup_if = InMemoryBridge::new();
+        let dkg_if = InMemoryBridge::new();
+        let node3 = Arc::new(DKGNode::from_qr(
+            "Node3",
+            Arc::new(qr),
+            setup_if.connect(),
+            dkg_if.connect(),
+        ));
+
+        // 3. Receive setup from Node 1 (Parties: [1, 2])
+        // Node 3 is in WaitForSetup. It receives the current setup.
+        // It should add itself -> [1, 2, 3].
+        let msg_from_1 = SignedDKGSetupMessage::sign(setup.clone(), 0, &party_sks[0]);
+        let returned_bytes = node3.test_handle_setup_msg(msg_from_1).unwrap();
+
+        // Check returned message - should be Node 3 adding itself
+        let returned_msg = SignedDKGSetupMessage::try_from(returned_bytes.as_slice()).unwrap();
+        assert_eq!(returned_msg.party_id, 2);
+        returned_msg.verify().unwrap();
+        let new_setup = returned_msg.setup;
+        assert_eq!(new_setup.parties.len(), 3);
+        for i in 0..setup.parties.len() {
+            assert_eq!(
+                new_setup.parties[i].friendly_name, setup.parties[i].friendly_name,
+                "Party {} name mismatch",
+                i
+            );
+            assert_eq!(
+                new_setup.parties[i].vk, setup.parties[i].vk,
+                "Party {} vk mismatch",
+                i
+            );
+        }
+        assert_eq!(new_setup.parties[2].friendly_name, "Node3");
+        // TODO: how to verify Node 3's VK ?
+
+        // Expectation: Node 3 should now be in WaitForSigs
+        // It has sent its own proposal [1, 2, 3] and is waiting for others to sign it.
+        assert_eq!(node3.get_state(), DKGState::WaitForSigs);
+
+        // 4. Receive signatures from existing nodes on the NEW setup [1, 2, 3]
+
+        // Now existing nodes need to sign THIS new_setup
+        let msg_sign_1 = SignedDKGSetupMessage::sign(new_setup.clone(), 0, &party_sks[0]);
+        let msg_sign_2 = SignedDKGSetupMessage::sign(new_setup.clone(), 1, &party_sks[1]);
+
+        // 5. Receive Signature from Node 1
+        let sent_bytes = node3.test_handle_setup_msg(msg_sign_1).unwrap();
+        assert!(sent_bytes.is_empty());
+
+        // Should still be waiting for sigs
+        assert_eq!(node3.get_state(), DKGState::WaitForSigs);
+
+        // 6. Receive Signature from Node 2
+        let sent_bytes = node3.test_handle_setup_msg(msg_sign_2).unwrap();
+        assert!(sent_bytes.is_empty());
+
+        // 7. Should be Ready
+        assert_eq!(node3.get_state(), DKGState::Ready);
+    }
+
+    #[test]
+    fn test_wait_for_sigs_receive_invalid_setup() {
+        // 1. Setup a node in WaitForSigs
+        let (setup, sks) = make_sample_setup(2, 2);
+        let wait_state = DKGWaitForSigs::new(setup.clone(), 1, &sks[1]);
+
+        // 2. Create an invalid setup (different instance)
+        let mut invalid_setup = (*setup).clone();
+        invalid_setup.instance = InstanceId::from_entropy();
+        let new_sk = NodeSecretKey::from_entropy();
+        invalid_setup.add_ourself("NewNode", &new_sk);
+        let invalid_msg = SignedDKGSetupMessage::sign(Arc::new(invalid_setup), 1, &new_sk);
+
+        // 3. Receive invalid setup
+        let boxed_state: Box<dyn DKGInternalState> = wait_state;
+        let ctx = make_test_context();
+        let (new_state, res) = boxed_state.receive_setup_msg(&ctx, invalid_msg);
+
+        // 4. Expect Error
+        assert!(matches!(res, Err(GeneralError::InvalidSetupMessage)));
+        assert!(matches!(new_state.get_state(), DKGState::WaitForSigs));
+    }
+
+    #[test]
+    fn test_wait_for_sigs_receive_invalid_party_list() {
+        // 1. Setup a node in WaitForSigs
+        let (setup, sks) = make_sample_setup(2, 2);
+        let wait_state = DKGWaitForSigs::new(setup.clone(), 1, &sks[1]);
+
+        // 2. Create an invalid setup (same instance, different party list content)
+        // We simulate a party changing their key or name
+        let mut invalid_setup = (*setup).clone();
+        // Modify the second party's VK effectively by replacing it or just changing name
+        invalid_setup.parties[0].friendly_name = "EvilNode".to_string();
+
+        // Sign it with a valid key (e.g. from party 1)
+        let invalid_msg = SignedDKGSetupMessage::sign(Arc::new(invalid_setup), 0, &sks[0]);
+
+        // 3. Receive invalid setup
+        let ctx = make_test_context();
+        let boxed_state: Box<dyn DKGInternalState> = wait_state;
+        let (new_state, res) = boxed_state.receive_setup_msg(&ctx, invalid_msg);
+
+        // 4. Expect Error
+        assert!(matches!(res, Err(GeneralError::InvalidSetupMessage)));
+        assert!(matches!(new_state.get_state(), DKGState::WaitForSigs));
+    }
+
+    #[test]
+    fn test_ready_node_transitions_to_wait_for_sigs_on_new_party() {
+        let (setup, sks) = make_sample_setup(2, 2);
+        let ready_state = DKGReadyState::new(setup.clone(), 1);
+        let ctx = make_test_context();
+
+        // New party joins
+        let mut new_setup = (*setup).clone();
+        let new_sk = NodeSecretKey::from_entropy();
+        let new_party_id = new_setup.add_ourself("NewParty", &new_sk);
+        let new_dev_info = new_setup.parties[new_party_id as usize].clone();
+        let msg = SignedDKGSetupMessage::sign(Arc::new(new_setup), new_party_id, &new_sk);
+
+        let boxed_state: Box<dyn DKGInternalState> = ready_state;
+        let (new_state, res) = boxed_state.receive_setup_msg(&ctx, msg);
+
+        // Should return ok and request update
+        assert!(matches!(res, Ok(true)));
+
+        // Should be in WaitForSigs state, NOT Ready
+        assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
+
+        // Verify setup in new state has 3 parties
+        let new_setup = new_state.get_setup().unwrap();
+        assert_eq!(new_setup.instance, setup.instance);
+        assert_eq!(new_setup.threshold, setup.threshold);
+        assert_eq!(new_setup.start, false);
+        assert_eq!(new_setup.parties.len(), 3);
+        assert_eq!(new_setup.parties[0], setup.parties[0]);
+        assert_eq!(new_setup.parties[1], setup.parties[1]);
+        assert_eq!(new_setup.parties[2], new_dev_info);
     }
 }
