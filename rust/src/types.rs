@@ -106,7 +106,7 @@ impl Keyshare {
     }
 }
 
-#[derive(Debug, Clone, uniffi::Object)]
+#[derive(Debug, Clone, PartialEq, uniffi::Object)]
 pub struct Signature(pub k256::ecdsa::Signature);
 
 impl TryFrom<&[u8]> for Signature {
@@ -326,30 +326,6 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for ArcVerifier<T> {
 /*****************************************************************************
  * Messages
  *****************************************************************************/
-
-/*
-#[derive(Serialize, Deserialize)]
-pub struct SignedMessage<'a> {
-    pub msg: &'a [u8],
-    pub sig: Signature,
-}
-
-pub fn sign_message<T: Serialize>(msg: &T, sk: &NodeSecretKey) -> Result<Vec<u8>, GeneralError> {
-    let msg = msg.to_bytes();
-    let sig = sk.try_sign(&msg).map_err(|e| GeneralError::SignatureError(e.to_string()))?;
-    Ok(postcard::to_allocvec(SignedMessage { msg, sig }).unwrap().to_bytes())
-}
-*/
-
-// impl SignedMessage {
-//     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
-//         postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
-//     }
-
-//     pub fn to_bytes(&self) -> Vec<u8> {
-//         postcard::to_allocvec(self).unwrap()
-//     }
-// }
 
 // A device is just a friendly name and a key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, uniffi::Object)]
