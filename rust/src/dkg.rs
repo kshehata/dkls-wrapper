@@ -1300,6 +1300,10 @@ mod tests {
         ))];
 
         assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
+        let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
+
+        let mut parties = tokio::task::JoinSet::new();
+        spawn_node(&mut parties, nodes[0].clone());
 
         let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
@@ -1314,15 +1318,8 @@ mod tests {
         )));
 
         assert_eq!(nodes[1].get_state(), DKGState::WaitForSetup);
-
-        let mut state_watchers = nodes
-            .iter()
-            .map(|n| DKGStateReceiver::watch_node(n))
-            .collect::<Vec<_>>();
-
-        let mut parties = tokio::task::JoinSet::new();
+        state_watchers.push(DKGStateReceiver::watch_node(&nodes[1]));
         spawn_node(&mut parties, nodes[1].clone());
-        spawn_node(&mut parties, nodes[0].clone());
 
         // Wait for both nodes to become ready.
         for watcher in &mut state_watchers {
@@ -1330,12 +1327,92 @@ mod tests {
         }
 
         assert!(nodes[0].start_dkg().await.is_ok());
-        // assert!(nodes[1].start_dkg().await.is_ok());
 
         // Wait for both nodes to finish DKG.
         for watcher in &mut state_watchers {
             assert!(watcher.wait_for_state(DKGState::Finished, 5000).await);
         }
+
+        let result1 = nodes[0].get_result().expect("Node1 result");
+        let result2 = nodes[1].get_result().expect("Node2 result");
+        assert_eq!(result1.0.key_id, result2.0.key_id);
+        assert_eq!(result1.0.party_id, 0);
+        assert_eq!(result2.0.party_id, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dkg_node_3_parties() {
+        println!("Starting DKG Node 3 Party Test");
+        let instance = InstanceId::from_entropy();
+
+        let setup_coord = InMemoryBridge::new();
+        let dkg_coord = InMemoryBridge::new();
+
+        let mut nodes = vec![Arc::new(DKGNode::new(
+            "Node1",
+            &instance,
+            3,
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        ))];
+
+        assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
+        let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
+
+        let mut parties = tokio::task::JoinSet::new();
+        spawn_node(&mut parties, nodes[0].clone());
+
+        let qr = Arc::new(nodes[0].get_qr().unwrap());
+        assert_eq!(qr.instance, instance);
+        assert_eq!(qr.party_id, 0);
+        // TODO: check vk
+
+        for i in 1..3 {
+            nodes.push(Arc::new(DKGNode::from_qr(
+                format!("Node{}", i + 1).as_str(),
+                qr.clone(),
+                setup_coord.connect(),
+                dkg_coord.connect(),
+            )));
+            assert_eq!(nodes[i].get_state(), DKGState::WaitForSetup);
+            state_watchers.push(DKGStateReceiver::watch_node(&nodes[i]));
+            spawn_node(&mut parties, nodes[i].clone());
+
+            // Wait for all nodes to become ready.
+            let exp_state = if i < 2 {
+                DKGState::WaitForParties
+            } else {
+                DKGState::Ready
+            };
+            for watcher in &mut state_watchers {
+                assert!(watcher.wait_for_state(exp_state, 2000).await);
+            }
+        }
+
+        // by now all nodes should be started and in ready state.
+        // should be able to start DKG from any node.
+        assert!(nodes[1].start_dkg().await.is_ok());
+
+        // Wait for all nodes to finish DKG.
+        for watcher in &mut state_watchers {
+            assert!(watcher.wait_for_state(DKGState::Finished, 5000).await);
+        }
+
+        // Check results
+        let mut results = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                node.get_result()
+                    .expect(format!("Node {} result", i).as_str())
+            })
+            .collect::<Vec<_>>();
+
+        let last_res = results.pop().unwrap();
+        assert!(
+            results.iter().all(|r| r.0.key_id == last_res.0.key_id),
+            "All key IDs equal."
+        );
     }
 
     #[test]
@@ -1899,7 +1976,6 @@ mod tests {
     #[test]
     fn test_finished_state_basics() {
         let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
         let finished_state =
             DKGFinishedState::new(parties.clone(), Err(GeneralError::Cancelled), 0);
         assert_eq!(finished_state.get_state(), DKGState::Finished);
