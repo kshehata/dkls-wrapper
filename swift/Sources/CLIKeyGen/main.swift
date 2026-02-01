@@ -98,7 +98,6 @@ func getMQTTInterface(_ instanceStr: String, _ sub: String) -> MQTTInterface {
     return MQTTInterface(
         client: client,
         topic: "dkg/\(instanceStr)/\(sub)",
-        retainOnSend: true,
     )
 }
 
@@ -164,17 +163,13 @@ var messageLoopTask = Task {
 }
 
 final class SetupChangeListener: DkgSetupChangeListener, @unchecked Sendable {
-    func onSetupChanged(setup: DkgSetupMessage) {
-        let parties = setup.getParties()
+    func onSetupChanged(parties: [DeviceInfo], myId: UInt8) {
         print("\n" + colorize("--- DKG Setup Update ---", .magenta))
-        // print("Instance: \(hexString(setup.getInstance().toBytes()))")
-        print("Threshold: \(setup.getThreshold())")
         print("Parties (\(parties.count)):")
-        let myIndex = setup.getMyPartyId()
         for (i, party) in parties.enumerated() {
             let verified: String
             let mark: String
-            if i == myIndex {
+            if i == myId {
                 verified = " (this device)"
                 mark = "•"
             } else if party.isVerified() {
