@@ -241,6 +241,12 @@ impl DKGNode {
         Ok(())
     }
 
+    pub fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().unwrap();
+        state.get_party_list()
+    }
+
     // Shortcut to receive and parse a setup message.
     async fn get_next_msg_interruptable(&self) -> Result<SignedDKGSetupMessage<'_>, GeneralError> {
         let receive_fut = self.setup_if.receive();
@@ -634,7 +640,8 @@ struct DKGContext {
 
 impl DKGContext {
     fn new(instance: InstanceId, threshold: u8, friendly_name: String, sk: NodeSecretKey) -> Self {
-        let dev = DeviceInfo::for_sk(friendly_name, &sk);
+        let mut dev = DeviceInfo::for_sk(friendly_name, &sk);
+        dev.verified = true;
         Self {
             instance,
             threshold,
@@ -742,7 +749,7 @@ impl DKGInternalState for DKGWaitForNetState {
         }
 
         // Make sure this is confirmation and get details.
-        let parties = match setup_msg.setup.message {
+        let mut parties = match setup_msg.setup.message {
             DKGSetupSubMessage::Confirm(parties) => parties,
             _ => return (self, Err(GeneralError::InvalidSetupMessage)),
         };
@@ -765,6 +772,13 @@ impl DKGInternalState for DKGWaitForNetState {
         // This should be impossible: our party ID matches the sender's party ID.
         if my_party_id == setup_msg.party_id as usize {
             return (self, Err(GeneralError::InvalidSetupMessage));
+        }
+
+        // Mark both ourselves and the inviter as verified.
+        {
+            let parties = Arc::make_mut(&mut parties);
+            parties[my_party_id].verified = true;
+            parties[self.qr_data.party_id as usize].verified = true;
         }
 
         // If there are only two parties, then we already have all sigs needed.
@@ -881,7 +895,7 @@ impl DKGInternalState for DKGWaitForSigs {
         self.add_signature(setup_msg.party_id, setup_msg.sig.into_owned());
 
         if self.has_all_signatures() {
-            let ready = DKGReadyState::new(parties, self.party_id, ctx.threshold);
+            let ready = DKGReadyState::new(self.parties, self.party_id, ctx.threshold);
             (ready, Ok(false))
         } else {
             (self, Ok(false))
@@ -969,7 +983,7 @@ impl DKGInternalState for DKGReadyState {
                 (state, Ok(true))
             }
 
-            DKGSetupSubMessage::Confirm(parties) => {
+            DKGSetupSubMessage::Confirm(mut parties) => {
                 // Reject if parties somehow differ, since at this point all
                 // parties should have been confirmed.
                 if !is_prefix_of(&self.parties, &parties) {
@@ -983,6 +997,13 @@ impl DKGInternalState for DKGReadyState {
                     1 => {
                         // Got a confirmation before the join message.
                         // Just move to the wait for sigs state state.
+                        // Copy verification status from our current list.
+                        Arc::make_mut(&mut parties)
+                            .iter_mut()
+                            .zip(self.parties.iter())
+                            .for_each(|(p, q)| {
+                                p.verified = q.verified;
+                            });
                         let mut state = DKGWaitForSigs::new(parties, self.party_id, context);
                         state.add_signature(setup_msg.party_id, setup_msg.sig.into_owned());
                         return (state, Ok(true));
@@ -1285,6 +1306,12 @@ mod tests {
             assert!(watcher.wait_for_state(DKGState::Ready, 2000).await);
         }
 
+        // Check verification status
+        assert!(nodes[0].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
+        assert!(nodes[1].get_party_list().unwrap()[0].verified);
+        assert!(nodes[1].get_party_list().unwrap()[1].verified);
+
         assert!(nodes[0].start_dkg().await.is_ok());
 
         // Wait for both nodes to finish DKG.
@@ -1297,6 +1324,11 @@ mod tests {
         assert_eq!(result1.0.key_id, result2.0.key_id);
         assert_eq!(result1.0.party_id, 0);
         assert_eq!(result2.0.party_id, 1);
+
+        assert!(nodes[0].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
+        assert!(nodes[1].get_party_list().unwrap()[0].verified);
+        assert!(nodes[1].get_party_list().unwrap()[1].verified);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1348,6 +1380,16 @@ mod tests {
             }
         }
 
+        assert!(nodes[0].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[2].verified);
+        assert!(nodes[1].get_party_list().unwrap()[0].verified);
+        assert!(nodes[1].get_party_list().unwrap()[1].verified);
+        assert!(!nodes[1].get_party_list().unwrap()[2].verified);
+        assert!(nodes[2].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[2].get_party_list().unwrap()[1].verified);
+        assert!(nodes[2].get_party_list().unwrap()[2].verified);
+
         // by now all nodes should be started and in ready state.
         // should be able to start DKG from any node.
         assert!(nodes[1].start_dkg().await.is_ok());
@@ -1372,6 +1414,16 @@ mod tests {
             results.iter().all(|r| r.0.key_id == last_res.0.key_id),
             "All key IDs equal."
         );
+
+        assert!(nodes[0].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
+        assert!(!nodes[0].get_party_list().unwrap()[2].verified);
+        assert!(nodes[1].get_party_list().unwrap()[0].verified);
+        assert!(nodes[1].get_party_list().unwrap()[1].verified);
+        assert!(!nodes[1].get_party_list().unwrap()[2].verified);
+        assert!(nodes[2].get_party_list().unwrap()[0].verified);
+        assert!(!nodes[2].get_party_list().unwrap()[1].verified);
+        assert!(nodes[2].get_party_list().unwrap()[2].verified);
     }
 
     #[test]
@@ -1413,7 +1465,7 @@ mod tests {
             DKGSetupMessage {
                 instance: Cow::Borrowed(&instance),
                 threshold: 2,
-                message: DKGSetupSubMessage::Confirm(new_party_list),
+                message: DKGSetupSubMessage::Confirm(new_party_list.clone()),
             },
             0, // Signed by party 0
             &party_sk[0],
@@ -1421,6 +1473,10 @@ mod tests {
 
         let _ = node3.test_handle_setup_msg(msg).unwrap();
         assert_eq!(node3.get_state(), DKGState::WaitForSigs);
+
+        Arc::make_mut(&mut new_party_list)[0].verified = true;
+        Arc::make_mut(&mut new_party_list)[2].verified = true;
+        assert_eq!(node3.get_party_list().unwrap(), new_party_list);
     }
 
     /*****************************************************************************
@@ -1441,6 +1497,14 @@ mod tests {
             ),
             party_sk,
         )
+    }
+
+    fn verify_parties(mut parties: Arc<PartyList>, id_list: &[usize]) -> Arc<PartyList> {
+        let mut mut_parties = Arc::make_mut(&mut parties);
+        for id in id_list {
+            mut_parties[*id].verified = true;
+        }
+        parties
     }
 
     fn make_sample_setup(t: u8, n: u8) -> (DKGSetupMessage<'static>, Vec<Arc<NodeSecretKey>>) {
@@ -1492,7 +1556,10 @@ mod tests {
         let DKGSetupSubMessage::Confirm(parties) = sent_msg.setup.message else {
             panic!("Expected Confirm message");
         };
-        assert_eq!(parties.as_ref(), exp_parties, "Party list mismatch");
+        assert!(
+            matches(parties.as_ref(), exp_parties),
+            "Party list mismatch"
+        );
     }
 
     /*****************************************************************************
@@ -1550,10 +1617,12 @@ mod tests {
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
-
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.as_ref(), parties.as_ref());
+        assert!(matches!(new_state.my_party_id(), Ok(2)));
         expect_sent_msg(&new_state, &ctx, 2, &parties);
+
+        let exp_parties = verify_parties(parties, &[0, 2]);
+        let new_setup_parties = new_state.get_party_list().unwrap();
+        assert_eq!(new_setup_parties.as_ref(), exp_parties.as_ref());
     }
 
     #[test]
@@ -1582,10 +1651,12 @@ mod tests {
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::Ready);
-
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.as_ref(), parties.as_ref());
+        assert!(matches!(new_state.my_party_id(), Ok(1)));
         expect_sent_msg(&new_state, &ctx, 1, &parties);
+
+        let exp_parties = verify_parties(parties, &[0, 1]);
+        let new_setup_parties = new_state.get_party_list().unwrap();
+        assert_eq!(new_setup_parties.as_ref(), exp_parties.as_ref());
     }
 
     #[test]
@@ -1624,6 +1695,7 @@ mod tests {
     #[test]
     fn test_wait_for_sigs_basics() {
         let (parties, party_sk) = make_sample_parties(3);
+        let parties = verify_parties(parties, &[0, 1]);
         let ctx = make_test_context_for_sk_arc(&party_sk[1]);
         let wait_state: Box<dyn DKGInternalState> = DKGWaitForSigs::new(parties.clone(), 1, &ctx);
         assert_eq!(wait_state.get_state(), DKGState::WaitForSigs);
@@ -1658,8 +1730,11 @@ mod tests {
     fn test_wait_for_sigs_receive_setup_ok() {
         let (parties, party_sk) = make_sample_parties(3);
         let ctx = make_test_context_for_sk_arc(&party_sk[1]);
-        let wait_state = DKGWaitForSigs::new(parties.clone(), 1, &ctx);
+        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
+        // This creates a state where we are the only ones to have signed.
+        let wait_state = DKGWaitForSigs::new(verified_parties.clone(), 1, &ctx);
 
+        // Receive party 2 signature.
         let msg = SignedDKGSetupMessage::sign(
             DKGSetupMessage {
                 instance: Cow::Borrowed(&ctx.instance),
@@ -1674,6 +1749,13 @@ mod tests {
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
 
+        // make sure verified parties are set correctly
+        let final_parties = new_state.get_party_list().unwrap();
+        assert!(final_parties[0].verified);
+        assert!(final_parties[1].verified);
+        assert!(!final_parties[2].verified);
+
+        // Receive party 0 signature.
         let msg = SignedDKGSetupMessage::sign(
             DKGSetupMessage {
                 instance: Cow::Borrowed(&ctx.instance),
@@ -1687,6 +1769,12 @@ mod tests {
         let (new_state, res) = new_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::Ready);
+
+        // make sure verified parties are set correctly
+        let final_parties = new_state.get_party_list().unwrap();
+        assert!(final_parties[0].verified);
+        assert!(final_parties[1].verified);
+        assert!(!final_parties[2].verified);
     }
 
     /*****************************************************************************
@@ -1754,10 +1842,10 @@ mod tests {
     fn test_ready_receive_setup_add_party() {
         let (parties, party_sk) = make_sample_parties(3);
         let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let instance = &ctx.instance;
 
+        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
         let short_parties = Arc::new(
-            parties[..parties.len() as usize - 1]
+            verified_parties[..verified_parties.len() as usize - 1]
                 .iter()
                 .cloned()
                 .collect::<PartyList>(),
@@ -1766,7 +1854,7 @@ mod tests {
 
         let msg = SignedDKGSetupMessage::sign(
             DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
+                instance: Cow::Borrowed(&ctx.instance),
                 threshold: 2,
                 message: DKGSetupSubMessage::Confirm(parties.clone()),
             },
@@ -1780,29 +1868,33 @@ mod tests {
 
         let new_setup_parties = new_state.get_party_list().unwrap();
         assert_eq!(new_setup_parties.len(), 3);
-        assert_eq!(new_setup_parties.as_ref(), parties.as_ref());
+        assert_eq!(new_setup_parties.as_ref(), verified_parties.as_ref());
 
         expect_sent_msg(&new_state, &ctx, 0, &parties);
     }
 
     #[test]
     fn test_ready_receive_setup_join_many_parties() {
-        let (parties, party_sk) = make_sample_parties(2);
+        let (parties, party_sk) = make_sample_parties(3);
         let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let instance = &ctx.instance;
-        let ready_state = DKGReadyState::new(parties.clone(), 0, 2);
 
-        let join_sk = NodeSecretKey::from_entropy();
-        let join_device = DeviceInfo::for_sk("JoinDev".to_string(), &join_sk);
+        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
+        let short_parties = Arc::new(
+            verified_parties[..verified_parties.len() as usize - 1]
+                .iter()
+                .cloned()
+                .collect::<PartyList>(),
+        );
+        let ready_state = DKGReadyState::new(short_parties.clone(), 0, 2);
 
         let msg = SignedDKGSetupMessage::sign(
             DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
+                instance: Cow::Borrowed(&ctx.instance),
                 threshold: 2,
-                message: DKGSetupSubMessage::Join(Cow::Borrowed(&join_device)),
+                message: DKGSetupSubMessage::Join(Cow::Borrowed(&parties[2])),
             },
             0,
-            &join_sk,
+            &party_sk[2],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
@@ -1810,9 +1902,11 @@ mod tests {
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
 
-        let mut exp_parties = (*parties).clone();
-        exp_parties.push(join_device.clone());
-        expect_sent_msg(&new_state, &ctx, 0, &exp_parties);
+        expect_sent_msg(&new_state, &ctx, 0, &parties);
+
+        let new_setup_parties = new_state.get_party_list().unwrap();
+        assert_eq!(new_setup_parties.len(), 3);
+        assert_eq!(new_setup_parties.as_ref(), verified_parties.as_ref());
     }
 
     #[test]
@@ -1842,12 +1936,12 @@ mod tests {
     fn test_ready_receive_setup_start_success() {
         let (parties, party_sk) = make_sample_parties(2);
         let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let instance = &ctx.instance;
-        let ready_state = DKGReadyState::new(parties.clone(), 0, 2);
+        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
+        let ready_state = DKGReadyState::new(verified_parties.clone(), 0, 2);
 
         let msg = SignedDKGSetupMessage::sign(
             DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
+                instance: Cow::Borrowed(&ctx.instance),
                 threshold: 2,
                 message: DKGSetupSubMessage::Start(parties.clone()),
             },
@@ -1858,6 +1952,8 @@ mod tests {
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::Running);
+        let new_party_list = new_state.get_party_list().unwrap();
+        assert_eq!(new_party_list.as_ref(), verified_parties.as_ref());
     }
 
     /*****************************************************************************

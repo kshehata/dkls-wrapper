@@ -194,7 +194,9 @@ final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
 
     func onStateChanged(oldState: DkgState, newState: DkgState) {
         print(colorize("State changed: \(oldState) -> \(newState)", .cyan))
-        if oldState == .waitForSetup && (newState == .waitForParties || newState == .ready) {
+        if oldState == .waitForSetup
+            && (newState == .waitForSigs || newState == .waitForParties || newState == .ready)
+        {
             do {
                 try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))
             } catch {

@@ -458,7 +458,7 @@ impl SignReplySession {
  *****************************************************************************/
 
 #[derive(Clone, uniffi::Object)]
-struct SignNode {
+pub struct SignNode {
     ctx: Arc<SignNodeContext>,
 }
 
