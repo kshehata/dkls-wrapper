@@ -27,7 +27,7 @@ struct DKGArgs: ParsableCommand {
     @Option(name: .long, help: "MQTT port.")
     var mqttPort: Int = 1883
 
-    @Option(name: .shortAndLong, help: "QR Data from other party.")
+    @Option(name: .shortAndLong, help: "QR Data from other device.")
     var qrData: String = ""
 
     func validate() throws {
@@ -163,23 +163,23 @@ var messageLoopTask = Task {
 }
 
 final class SetupChangeListener: DkgSetupChangeListener, @unchecked Sendable {
-    func onSetupChanged(parties: [DeviceInfo], myId: UInt8) {
+    func onSetupChanged(devices: [DeviceInfo], myId: UInt8) {
         print("\n" + colorize("--- DKG Setup Update ---", .magenta))
-        print("Parties (\(parties.count)):")
-        for (i, party) in parties.enumerated() {
+        print("Devices (\(devices.count)):")
+        for (i, device) in devices.enumerated() {
             let verified: String
             let mark: String
             if i == myId {
                 verified = " (this device)"
                 mark = "•"
-            } else if party.isVerified() {
+            } else if device.isVerified() {
                 verified = " (Verified)"
                 mark = "✓"
             } else {
                 verified = ""
                 mark = "?"
             }
-            print("  \(i + 1). \(mark) \(party.name())\(verified)")
+            print("  \(i + 1). \(mark) \(device.name())\(verified)")
         }
         print(colorize("------------------------", .magenta) + "\n")
     }
@@ -195,7 +195,7 @@ final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
     func onStateChanged(oldState: DkgState, newState: DkgState) {
         print(colorize("State changed: \(oldState) -> \(newState)", .cyan))
         if oldState == .waitForSetup
-            && (newState == .waitForSigs || newState == .waitForParties || newState == .ready)
+            && (newState == .waitForSigs || newState == .waitForDevices || newState == .ready)
         {
             do {
                 try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))

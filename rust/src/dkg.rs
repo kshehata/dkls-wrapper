@@ -167,7 +167,7 @@ impl DKGNode {
         //     self.context.friendly_name,
         //     self.get_state()
         // );
-        if self.get_state() == DKGState::WaitForParties
+        if self.get_state() == DKGState::WaitForDevices
             || self.get_state() == DKGState::WaitForSetup
         {
             // println!("{:?} Sending setup message", self.context.friendly_name);
@@ -670,7 +670,7 @@ impl<'a> SignedDKGSetupMessage<'a> {
 pub enum DKGState {
     WaitForSetup,
     WaitForSigs,
-    WaitForParties,
+    WaitForDevices,
     Ready,
     Running,
     Finished,
@@ -701,7 +701,7 @@ trait DKGInternalState: Send + Sync + 'static {
 
     fn my_device_index(&self) -> Result<u8, GeneralError> {
         Err(GeneralError::InvalidState(
-            "Cannot get party ID in current state.".to_string(),
+            "Cannot get device index in current state.".to_string(),
         ))
     }
 
@@ -710,7 +710,7 @@ trait DKGInternalState: Send + Sync + 'static {
     // We'll usually return a clone of what's in the state var.
     fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
         Err(GeneralError::InvalidState(
-            "Cannot get party list in current state.".to_string(),
+            "Cannot get device list in current state.".to_string(),
         ))
     }
 
@@ -801,7 +801,7 @@ impl DKGInternalState for DKGWaitForNetState {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
 
-        // Verify inviter is in parties (sanity check)
+        // Verify inviter is in devices (sanity check)
         let devices = setup_msg.setup.devices;
         if self.qr_data.device_index as usize >= devices.len()
             || devices[self.qr_data.device_index as usize].vk.as_ref() != &self.qr_data.vk
@@ -820,7 +820,7 @@ impl DKGInternalState for DKGWaitForNetState {
             return (self, Ok(false));
         };
 
-        // This should be impossible: our party ID matches the sender's party ID.
+        // This should be impossible: our device index matches the sender's device index.
         if my_device_index == setup_msg.device_index as usize {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
@@ -836,7 +836,7 @@ impl DKGInternalState for DKGWaitForNetState {
         // And then convert to Arcs
         let devices: DeviceList = devices.into_iter().map(Arc::new).collect();
 
-        // If there are only two parties, then we already have all sigs needed.
+        // If there are only two devices, then we already have all sigs needed.
         let state: Box<dyn DKGInternalState> = if devices.len() == 2 {
             DKGReadyState::new(devices, my_device_index as u8, context.threshold)
         } else {
@@ -1000,7 +1000,7 @@ impl DKGReadyState {
 impl DKGInternalState for DKGReadyState {
     fn get_state(&self) -> DKGState {
         if self.devices.len() < self.threshold.into() {
-            DKGState::WaitForParties
+            DKGState::WaitForDevices
         } else {
             DKGState::Ready
         }
@@ -1041,8 +1041,8 @@ impl DKGInternalState for DKGReadyState {
             }
 
             DKGSetupMessageType::Confirm => {
-                // Reject if parties somehow differ, since at this point all
-                // parties should have been confirmed.
+                // Reject if devices somehow differ, since at this point all
+                // devices should have been confirmed.
                 if !list_prefix_matches(&self.devices, &setup_msg.setup.devices) {
                     return (self, Err(GeneralError::InvalidSetupMessage));
                 }
@@ -1062,7 +1062,7 @@ impl DKGInternalState for DKGReadyState {
                         return (state, Ok(true));
                     }
                     _ => {
-                        // Differ by more than 1 party, not allowed.
+                        // Differ by more than 1 device, not allowed.
                         return (self, Err(GeneralError::InvalidSetupMessage));
                     }
                 }
@@ -1075,7 +1075,7 @@ impl DKGInternalState for DKGReadyState {
                 if self.devices.len() < context.threshold as usize {
                     return (
                         self,
-                        Err(GeneralError::InvalidState("Not enough parties".to_string())),
+                        Err(GeneralError::InvalidState("Not enough devices".to_string())),
                     );
                 }
                 (
@@ -1336,7 +1336,7 @@ mod tests {
             dkg_coord.connect(),
         ))];
 
-        assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
+        assert_eq!(nodes[0].get_state(), DKGState::WaitForDevices);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
         let mut devices = tokio::task::JoinSet::new();
@@ -1404,7 +1404,7 @@ mod tests {
             dkg_coord.connect(),
         ))];
 
-        assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
+        assert_eq!(nodes[0].get_state(), DKGState::WaitForDevices);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
         let mut devices = tokio::task::JoinSet::new();
@@ -1428,7 +1428,7 @@ mod tests {
 
             // Wait for all nodes to become ready.
             let exp_state = if i < 2 {
-                DKGState::WaitForParties
+                DKGState::WaitForDevices
             } else {
                 DKGState::Ready
             };
@@ -1927,7 +1927,7 @@ mod tests {
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Err(GeneralError::InvalidState(_))));
-        assert_eq!(new_state.get_state(), DKGState::WaitForParties);
+        assert_eq!(new_state.get_state(), DKGState::WaitForDevices);
     }
 
     #[test]
