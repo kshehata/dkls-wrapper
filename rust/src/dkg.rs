@@ -35,7 +35,7 @@ pub struct DKGNode {
 
 #[uniffi::export(callback_interface)]
 pub trait DKGSetupChangeListener: Send + Sync {
-    fn on_setup_changed(&self, parties: Vec<Arc<DeviceInfo>>, my_id: u8);
+    fn on_setup_changed(&self, devices: DeviceList, my_id: u8);
 }
 
 #[uniffi::export(callback_interface)]
@@ -59,9 +59,9 @@ impl DKGNode {
             name.to_string(),
             NodeSecretKey::from_entropy(),
         );
-        let parties = Arc::new(vec![context.dev.clone()]);
+        let devices = vec![context.dev.clone()];
         Self {
-            state: RwLock::new(Some(DKGReadyState::new(parties, 0, threshold))),
+            state: RwLock::new(Some(DKGReadyState::new(devices, 0, threshold))),
             listeners: RwLock::new(Vec::new()),
             setup_listeners: RwLock::new(Vec::new()),
             context,
@@ -125,18 +125,15 @@ impl DKGNode {
     pub fn add_setup_change_listener(&self, listener: Box<dyn DKGSetupChangeListener>) {
         // Also notify the listener immediately with the current setup if available.
         // TODO: should probably refactor both of these into one call.
-        if let (Ok(parties), Ok(my_id)) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().unwrap();
-            let parties = state.get_party_list();
-            let my_id = state.my_party_id();
-            (parties, my_id)
-        } {
-            let parties = parties
-                .iter()
-                .map(|p| Arc::new(p.clone()))
-                .collect::<Vec<_>>();
-            listener.on_setup_changed(parties, my_id);
+        if let Ok((devices, my_id)) = self
+            .state
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_device_list()
+        {
+            listener.on_setup_changed(devices, my_id);
         }
         self.setup_listeners.write().unwrap().push(listener);
     }
@@ -193,7 +190,7 @@ impl DKGNode {
             }
         }
         // Start the actual DKG
-        let (parties, party_id) = {
+        let (devices, device_index) = {
             let guard = self.state.read().unwrap();
             let state = guard.as_ref().unwrap();
             if state.get_state() != DKGState::Running {
@@ -202,17 +199,15 @@ impl DKGNode {
                     "Calculated state is running but stored state is not?".to_string(),
                 ));
             }
-            (
-                state.get_party_list().unwrap(),
-                state.my_party_id().unwrap(),
-            )
+            state.get_device_list().unwrap()
         };
 
         // println!("{:?} Starting DKG", self.context.friendly_name);
-        let res = self.do_dkg_internal(parties.clone(), party_id).await;
+        let res = self.do_dkg_internal(&devices, device_index).await;
         // println!("{:?} DKG Complete?", self.context.friendly_name);
 
-        let _ = self.do_state_fn(|_| (DKGFinishedState::new(parties, res, party_id), Ok(false)));
+        let _ =
+            self.do_state_fn(|_| (DKGFinishedState::new(devices, res, device_index), Ok(false)));
         Ok(())
     }
 }
@@ -222,29 +217,32 @@ impl DKGNode {
         let qr = QRData {
             instance: self.context.instance.clone(),
             threshold: self.context.threshold,
-            party_id: self.state.read().unwrap().as_ref().unwrap().my_party_id()?,
+            device_index: self
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .my_device_index()?,
             vk: self.context.dev.vk.clone(),
         };
         Ok(qr)
     }
 
     pub fn receive_qr(&self, qr: QRData) -> Result<(), GeneralError> {
-        let (maybe_party_list, my_id) = {
-            let mut guard = self.state.write().unwrap();
-            let state = guard.as_mut().unwrap();
-            state.scan_qr(qr)?;
-            (state.get_party_list().ok(), state.my_party_id().ok())
-        };
-        if let (Some(party_list), Some(my_id)) = (maybe_party_list, my_id) {
-            self.notify_setup_listeners(party_list, my_id);
-        }
+        let (devices, my_id) = self.state.write().unwrap().as_mut().unwrap().scan_qr(&qr)?;
+        self.notify_setup_listeners(devices, my_id);
         Ok(())
     }
 
-    pub fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().unwrap();
-        state.get_party_list()
+    pub fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
+        self.state
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_device_list()
+            .clone()
     }
 
     // Shortcut to receive and parse a setup message.
@@ -289,17 +287,17 @@ impl DKGNode {
 
     async fn do_dkg_internal(
         &self,
-        parties: Arc<PartyList>,
-        party_id: u8,
+        devices: &DeviceList,
+        device_index: u8,
     ) -> Result<Keyshare, GeneralError> {
         // TODO: should maybe put a Mutex here to make sure it never runs twice?
 
-        let vkrefs: Vec<&NodeVerifyingKey> = parties.iter().map(|dev| &dev.vk).collect();
-        let ranks = vec![0u8; parties.len() as usize];
+        let vkrefs: Vec<&NodeVerifyingKey> = devices.iter().map(|dev| &dev.vk).collect();
+        let ranks = vec![0u8; devices.len() as usize];
         let setup_msg = KeygenSetup::new(
             self.context.instance.into(),
             &self.context.sk,
-            party_id.into(),
+            device_index.into(),
             vkrefs,
             &ranks,
             self.context.threshold.into(),
@@ -330,15 +328,14 @@ impl DKGNode {
             Box<dyn DKGInternalState>,
         ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>),
     {
-        let (old_state_enum, new_state_enum, res, old_parties, new_parties, my_id) = {
+        let (old_state_enum, new_state_enum, res, old_devices, new_devices) = {
             let mut guard = self.state.write().unwrap();
             let current_state = guard.take().unwrap();
             let old_state_enum = current_state.get_state();
-            let old_parties = current_state.get_party_list().ok();
+            let old_devices = current_state.get_device_list().ok();
             let (new_state, res) = f(current_state);
             let new_state_enum = new_state.get_state();
-            let new_parties = new_state.get_party_list().ok();
-            let my_id = new_state.my_party_id().ok();
+            let new_devices = new_state.get_device_list().ok();
 
             // If the state_fn indicated to send an update to the network,
             // get the signed state message and serialize it before doing
@@ -353,18 +350,17 @@ impl DKGNode {
                 old_state_enum,
                 new_state_enum,
                 res,
-                old_parties,
-                new_parties,
-                my_id,
+                old_devices,
+                new_devices,
             )
         };
 
         // Update listeners of changes.
         self.notify_listeners(old_state_enum, new_state_enum);
-        if let (Some(parties), Some(my_id)) = (new_parties, my_id) {
-            match old_parties {
-                Some(s2) if s2 == parties => (),
-                _ => self.notify_setup_listeners(parties, my_id),
+        if let Some((devices, my_id)) = new_devices {
+            match old_devices {
+                Some((d2, _)) if d2 == devices => (),
+                _ => self.notify_setup_listeners(devices, my_id),
             }
         }
 
@@ -381,15 +377,10 @@ impl DKGNode {
         }
     }
 
-    fn notify_setup_listeners(&self, parties: Arc<PartyList>, my_id: u8) {
-        // Have to convert to Vec<Arc<DeviceInfo>> for UniFFI
-        let parties = parties
-            .iter()
-            .map(|p| Arc::new(p.clone()))
-            .collect::<Vec<_>>();
+    fn notify_setup_listeners(&self, devices: DeviceList, my_id: u8) {
         let listeners = self.setup_listeners.read().unwrap();
         for listener in listeners.iter() {
-            listener.on_setup_changed(parties.clone(), my_id);
+            listener.on_setup_changed(devices.clone(), my_id);
         }
     }
 }
@@ -405,7 +396,7 @@ pub struct QRData {
     // TODO: should make all of these read-only.
     pub instance: InstanceId,
     pub threshold: u8,
-    pub party_id: u8,
+    pub device_index: u8,
     pub vk: NodeVerifyingKey,
 }
 
@@ -450,8 +441,8 @@ impl QRData {
         self.instance
     }
 
-    pub fn get_party_id(&self) -> u8 {
-        self.party_id
+    pub fn get_device_index(&self) -> u8 {
+        self.device_index
     }
 
     pub fn get_vk(&self) -> NodeVerifyingKey {
@@ -459,47 +450,81 @@ impl QRData {
     }
 }
 
+// Wrapper around DeviceInfo so we can serialize it without
+// the verified bit and makes it easy to compare.
+// We need to store Arc<DeviceInfo> to pass to UniFFI anyway,
+// so might as well just wrap that instead of using Cow.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-enum DKGSetupSubMessage<'a> {
-    Join(Cow<'a, DeviceInfo>),
-    Confirm(Arc<PartyList>),
-    Start(Arc<PartyList>),
+struct DeviceNetTransfer<'a> {
+    friendly_name: Cow<'a, String>,
+    vk: Cow<'a, NodeVerifyingKey>,
 }
 
-type PartyList = Vec<DeviceInfo>;
+impl<'a> From<&'a DeviceInfo> for DeviceNetTransfer<'a> {
+    fn from(value: &'a DeviceInfo) -> Self {
+        Self {
+            friendly_name: Cow::Borrowed(&value.friendly_name),
+            vk: Cow::Borrowed(&value.vk),
+        }
+    }
+}
 
-fn verify_qr(list: &mut PartyList, qr: &QRData) -> Result<(), GeneralError> {
-    if list.len() <= qr.party_id as usize || list[qr.party_id as usize].vk != qr.vk {
+impl<'a> From<DeviceNetTransfer<'a>> for DeviceInfo {
+    fn from(value: DeviceNetTransfer<'a>) -> Self {
+        DeviceInfo::new(value.friendly_name.into_owned(), value.vk.into_owned())
+    }
+}
+
+impl<'a> PartialEq<DeviceInfo> for DeviceNetTransfer<'a> {
+    fn eq(&self, other: &DeviceInfo) -> bool {
+        self.friendly_name.as_ref() == &other.friendly_name && self.vk.as_ref() == &other.vk
+    }
+}
+
+type DeviceList = Vec<Arc<DeviceInfo>>;
+
+fn verify_qr(list: &mut DeviceList, qr: &QRData) -> Result<(), GeneralError> {
+    if list.len() <= qr.device_index as usize || list[qr.device_index as usize].vk != qr.vk {
         return Err(GeneralError::InvalidInput(
             "Setup and QR mismatch".to_string(),
         ));
     }
-    list[qr.party_id as usize].verified = true;
+    Arc::make_mut(&mut list[qr.device_index as usize]).verified = true;
 
     Ok(())
 }
 
-fn is_prefix_of(list: &PartyList, new_list: &PartyList) -> bool {
-    // Make sure there are at least as many parties.
-    if new_list.len() < list.len() {
-        return false;
-    }
-
-    // Check that VKs and friendly names are the same.
-    list.iter()
-        .zip(new_list.iter())
-        .all(|(a, b)| (a.vk == b.vk) && (a.friendly_name == b.friendly_name))
+// Checks that all of the devices in the first list match the beginning of the second.
+fn list_prefix_matches(list: &DeviceList, new_list: &[DeviceNetTransfer]) -> bool {
+    (new_list.len() >= list.len())
+        && list
+            .iter()
+            .zip(new_list.iter())
+            .all(|(a, b)| b == a.as_ref())
 }
 
-fn matches(list: &PartyList, new_list: &PartyList) -> bool {
-    list.len() == new_list.len() && is_prefix_of(list, new_list)
+// Check that the two lists match exactly other than the verified bit.
+fn list_matches(list: &DeviceList, new_list: &[DeviceNetTransfer]) -> bool {
+    (new_list.len() == list.len())
+        && list
+            .iter()
+            .zip(new_list.iter())
+            .all(|(a, b)| b == a.as_ref())
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum DKGSetupMessageType {
+    Join,
+    Confirm,
+    Start,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct DKGSetupMessage<'a> {
+    msg_type: DKGSetupMessageType,
     instance: Cow<'a, InstanceId>,
     threshold: u8,
-    message: DKGSetupSubMessage<'a>,
+    devices: Vec<DeviceNetTransfer<'a>>,
 }
 
 impl<'a> TryFrom<&[u8]> for DKGSetupMessage<'a> {
@@ -519,29 +544,42 @@ impl<'a> TryFrom<&str> for DKGSetupMessage<'a> {
 }
 
 impl<'a> DKGSetupMessage<'a> {
+    pub fn make_join(instance: &'a InstanceId, threshold: u8, device: &'a DeviceInfo) -> Self {
+        Self {
+            msg_type: DKGSetupMessageType::Join,
+            instance: Cow::Borrowed(instance),
+            threshold,
+            devices: vec![device.into()],
+        }
+    }
+
+    pub fn make_confirm(instance: &'a InstanceId, threshold: u8, devices: &'a DeviceList) -> Self {
+        Self {
+            msg_type: DKGSetupMessageType::Confirm,
+            instance: Cow::Borrowed(instance),
+            threshold,
+            devices: devices.iter().map(|d| d.as_ref().into()).collect(),
+        }
+    }
+
+    pub fn make_start(instance: &'a InstanceId, threshold: u8, devices: &'a DeviceList) -> Self {
+        Self {
+            msg_type: DKGSetupMessageType::Start,
+            instance: Cow::Borrowed(instance),
+            threshold,
+            devices: devices.iter().map(|d| d.as_ref().into()).collect(),
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
-    }
-
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-
-    pub fn get_vk(&self, party_id: u8) -> Result<&NodeVerifyingKey, GeneralError> {
-        match &self.message {
-            DKGSetupSubMessage::Join(device) => Ok(&device.vk),
-            DKGSetupSubMessage::Confirm(parties) | DKGSetupSubMessage::Start(parties) => parties
-                .get(party_id as usize)
-                .map(|p| &p.vk)
-                .ok_or(GeneralError::InvalidInput("Invalid party ID".to_string())),
-        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SignedDKGSetupMessage<'a> {
     setup: DKGSetupMessage<'a>,
-    party_id: u8,
+    device_index: u8,
     sig: Cow<'a, Signature>,
 }
 
@@ -566,23 +604,19 @@ impl<'a> SignedDKGSetupMessage<'a> {
         postcard::to_allocvec(self).unwrap()
     }
 
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-
-    pub fn from_sig(setup: DKGSetupMessage<'a>, party_id: u8, sig: Cow<'a, Signature>) -> Self {
+    pub fn from_sig(setup: DKGSetupMessage<'a>, device_index: u8, sig: Cow<'a, Signature>) -> Self {
         Self {
             setup,
-            party_id,
+            device_index,
             sig,
         }
     }
 
-    pub fn sign(setup: DKGSetupMessage<'a>, party_id: u8, sk: &NodeSecretKey) -> Self {
+    pub fn sign(setup: DKGSetupMessage<'a>, device_index: u8, sk: &NodeSecretKey) -> Self {
         let sig = Signature(sk.try_sign(setup.to_bytes().as_ref()).unwrap());
         Self {
             setup,
-            party_id,
+            device_index,
             sig: Cow::Owned(sig),
         }
     }
@@ -591,29 +625,40 @@ impl<'a> SignedDKGSetupMessage<'a> {
         Signature(sk.try_sign(setup.to_bytes().as_ref()).unwrap())
     }
 
-    pub fn gen_confirm_sig(parties: Arc<PartyList>, ctx: &DKGContext) -> Signature {
-        Self::gen_sig(
-            &DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: ctx.threshold,
-                message: DKGSetupSubMessage::Confirm(parties),
-            },
-            &ctx.sk,
-        )
+    pub fn make_confirm(devices: &'a DeviceList, device_index: u8, ctx: &'a DKGContext) -> Self {
+        let setup = DKGSetupMessage::make_confirm(&ctx.instance, ctx.threshold, devices);
+        Self::sign(setup, device_index, &ctx.sk)
+    }
+
+    pub fn make_start(devices: &'a DeviceList, device_index: u8, ctx: &'a DKGContext) -> Self {
+        let setup = DKGSetupMessage::make_start(&ctx.instance, ctx.threshold, devices);
+        Self::sign(setup, device_index, &ctx.sk)
     }
 
     pub fn verify(&self) -> Result<(), GeneralError> {
-        Self::verify_for_setup(&self.setup, self.party_id as usize, &self.sig)
+        Self::verify_for_setup(&self.setup, self.device_index as usize, &self.sig)
     }
 
     // Helper to verify a signature without constructing a SignedDKGSetupMessage.
     pub fn verify_for_setup(
         setup: &DKGSetupMessage,
-        party_id: usize,
+        device_index: usize,
         sig: &Signature,
     ) -> Result<(), GeneralError> {
-        let vk = setup.get_vk(party_id as u8)?;
-        vk.verify(setup.to_bytes().as_ref(), sig)
+        // Only in the case of a join message we have to check that only 1 device is in the list.
+        if setup.msg_type == DKGSetupMessageType::Join
+            && (device_index != 0 || setup.devices.len() != 1)
+        {
+            return Err(GeneralError::InvalidInput(
+                "Invalid join message".to_string(),
+            ));
+        }
+        let Some(dev) = setup.devices.get(device_index) else {
+            return Err(GeneralError::InvalidInput(
+                "Invalid device index".to_string(),
+            ));
+        };
+        dev.vk.verify(setup.to_bytes().as_ref(), sig)
     }
 }
 
@@ -634,7 +679,7 @@ pub enum DKGState {
 struct DKGContext {
     instance: InstanceId,
     threshold: u8,
-    dev: DeviceInfo,
+    dev: Arc<DeviceInfo>,
     sk: NodeSecretKey,
 }
 
@@ -645,7 +690,7 @@ impl DKGContext {
         Self {
             instance,
             threshold,
-            dev,
+            dev: Arc::new(dev),
             sk,
         }
     }
@@ -654,13 +699,16 @@ impl DKGContext {
 trait DKGInternalState: Send + Sync + 'static {
     fn get_state(&self) -> DKGState;
 
-    fn my_party_id(&self) -> Result<u8, GeneralError> {
+    fn my_device_index(&self) -> Result<u8, GeneralError> {
         Err(GeneralError::InvalidState(
             "Cannot get party ID in current state.".to_string(),
         ))
     }
 
-    fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
+    // Get the list of devices, and the index of this device in the list.
+    // DeviceList is a vector of arcs, so it's cheap to clone.
+    // We'll usually return a clone of what's in the state var.
+    fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
         Err(GeneralError::InvalidState(
             "Cannot get party list in current state.".to_string(),
         ))
@@ -673,7 +721,9 @@ trait DKGInternalState: Send + Sync + 'static {
         ))
     }
 
-    fn scan_qr(&mut self, _: QRData) -> Result<(), GeneralError> {
+    // We scanned a QR code of another device. Update the device list,
+    // and return it here so we can update the UI.
+    fn scan_qr(&mut self, _: &QRData) -> Result<(DeviceList, u8), GeneralError> {
         Err(GeneralError::InvalidState(
             "Cannot scan QR in current state.".to_string(),
         ))
@@ -728,12 +778,9 @@ impl DKGInternalState for DKGWaitForNetState {
     }
 
     fn get_bytes_to_send(&self, context: &DKGContext) -> Result<Vec<u8>, GeneralError> {
-        let join_msg = DKGSetupMessage {
-            instance: Cow::Borrowed(&context.instance),
-            threshold: context.threshold,
-            message: DKGSetupSubMessage::Join(Cow::Borrowed(&context.dev)),
-        };
-        // Join messages use party_id 0 (ignored).
+        let join_msg =
+            DKGSetupMessage::make_join(&context.instance, context.threshold, &context.dev);
+        // Join messages use device_index 0 (ignored).
         let msg = SignedDKGSetupMessage::sign(join_msg, 0, &context.sk);
         Ok(msg.to_bytes())
     }
@@ -744,25 +791,29 @@ impl DKGInternalState for DKGWaitForNetState {
         setup_msg: SignedDKGSetupMessage,
     ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         // Instance ID must match scanned QR.
+        // (This should have been checked already, but being defensive.)
         if setup_msg.setup.instance.as_ref() != &context.instance {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
 
         // Make sure this is confirmation and get details.
-        let mut parties = match setup_msg.setup.message {
-            DKGSetupSubMessage::Confirm(parties) => parties,
-            _ => return (self, Err(GeneralError::InvalidSetupMessage)),
-        };
+        if setup_msg.setup.msg_type != DKGSetupMessageType::Confirm {
+            return (self, Err(GeneralError::InvalidSetupMessage));
+        }
 
         // Verify inviter is in parties (sanity check)
-        if self.qr_data.party_id as usize >= parties.len()
-            || parties[self.qr_data.party_id as usize].vk != self.qr_data.vk
+        let devices = setup_msg.setup.devices;
+        if self.qr_data.device_index as usize >= devices.len()
+            || devices[self.qr_data.device_index as usize].vk.as_ref() != &self.qr_data.vk
         {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
 
         // Find ourselves
-        let Some(my_party_id) = parties.iter().position(|p| p.vk == context.dev.vk) else {
+        let Some(my_device_index) = devices
+            .iter()
+            .position(|p| p.vk.as_ref() == &context.dev.vk)
+        else {
             // TODO: pretty sure this is wrong, Gemini.
             // We might receive a confirm message before our join message has been processed.
             // In this case, we just ignore the message and wait for the updated one.
@@ -770,25 +821,29 @@ impl DKGInternalState for DKGWaitForNetState {
         };
 
         // This should be impossible: our party ID matches the sender's party ID.
-        if my_party_id == setup_msg.party_id as usize {
+        if my_device_index == setup_msg.device_index as usize {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
 
+        // Convert the list into a Vec<DeviceInfo>.
+        // TODO: might be slightly more efficient if we do all 3 steps in one pass ?
+        let mut devices: Vec<DeviceInfo> = devices.into_iter().map(|d| d.into()).collect();
+
         // Mark both ourselves and the inviter as verified.
-        {
-            let parties = Arc::make_mut(&mut parties);
-            parties[my_party_id].verified = true;
-            parties[self.qr_data.party_id as usize].verified = true;
-        }
+        devices[my_device_index].verified = true;
+        devices[self.qr_data.device_index as usize].verified = true;
+
+        // And then convert to Arcs
+        let devices: DeviceList = devices.into_iter().map(Arc::new).collect();
 
         // If there are only two parties, then we already have all sigs needed.
-        let state: Box<dyn DKGInternalState> = if parties.len() == 2 {
-            DKGReadyState::new(parties, my_party_id as u8, context.threshold)
+        let state: Box<dyn DKGInternalState> = if devices.len() == 2 {
+            DKGReadyState::new(devices, my_device_index as u8, context.threshold)
         } else {
             // Create the new state with our signature.
-            let mut new_state = DKGWaitForSigs::new(parties, my_party_id as u8, context);
+            let mut new_state = DKGWaitForSigs::new(devices, my_device_index as u8, context);
             // Add the received signature.
-            new_state.add_signature(setup_msg.party_id, setup_msg.sig.into_owned());
+            new_state.add_signature(setup_msg.device_index, setup_msg.sig.into_owned());
             new_state
         };
         (state, Ok(true))
@@ -814,28 +869,32 @@ impl DKGInternalState for DKGWaitForNetState {
  *****************************************************************************/
 
 struct DKGWaitForSigs {
-    parties: Arc<PartyList>,
-    party_id: u8,
+    devices: DeviceList,
+    device_index: u8,
     signatures: Vec<Option<Signature>>,
 }
 
 impl DKGWaitForSigs {
-    fn new(parties: Arc<PartyList>, party_id: u8, ctx: &DKGContext) -> Box<Self> {
-        let num_parties = parties.len();
-        let my_sig = SignedDKGSetupMessage::gen_confirm_sig(parties.clone(), ctx);
+    fn new(devices: DeviceList, device_index: u8, ctx: &DKGContext) -> Box<Self> {
+        let num_devices = devices.len();
+        let my_sig = {
+            let setup = DKGSetupMessage::make_confirm(&ctx.instance, ctx.threshold, &devices);
+            SignedDKGSetupMessage::gen_sig(&setup, &ctx.sk)
+        };
         let mut state = Box::new(Self {
-            parties,
-            party_id,
-            signatures: vec![None; num_parties as usize],
+            devices,
+            device_index,
+            signatures: vec![None; num_devices as usize],
         });
         // Sign the proposal ourselves.
-        state.add_signature(party_id, my_sig);
+        state.add_signature(device_index, my_sig);
         state
     }
 
-    fn add_signature(&mut self, party_id: u8, sig: Signature) {
-        if (party_id as usize) < self.signatures.len() {
-            self.signatures[party_id as usize] = Some(sig);
+    fn add_signature(&mut self, device_index: u8, sig: Signature) {
+        // TODO: should we flag this is out of bounds ?
+        if (device_index as usize) < self.signatures.len() {
+            self.signatures[device_index as usize] = Some(sig);
         }
     }
 
@@ -849,30 +908,31 @@ impl DKGInternalState for DKGWaitForSigs {
         DKGState::WaitForSigs
     }
 
-    fn my_party_id(&self) -> Result<u8, GeneralError> {
-        Ok(self.party_id)
+    fn my_device_index(&self) -> Result<u8, GeneralError> {
+        Ok(self.device_index)
     }
 
-    fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
-        Ok(self.parties.clone())
+    fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
+        Ok((self.devices.clone(), self.device_index))
     }
 
     fn get_bytes_to_send(&self, ctx: &DKGContext) -> Result<Vec<u8>, GeneralError> {
-        let setup = DKGSetupMessage {
-            instance: Cow::Borrowed(&ctx.instance),
-            threshold: ctx.threshold,
-            message: DKGSetupSubMessage::Confirm(self.parties.clone()),
-        };
+        let setup = DKGSetupMessage::make_confirm(&ctx.instance, ctx.threshold, &self.devices);
         let msg = SignedDKGSetupMessage::from_sig(
             setup,
-            self.party_id,
-            Cow::Borrowed(self.signatures[self.party_id as usize].as_ref().unwrap()),
+            self.device_index,
+            Cow::Borrowed(
+                self.signatures[self.device_index as usize]
+                    .as_ref()
+                    .unwrap(),
+            ),
         );
         Ok(msg.to_bytes())
     }
 
-    fn scan_qr(&mut self, qr_data: QRData) -> Result<(), GeneralError> {
-        verify_qr(Arc::make_mut(&mut self.parties), &qr_data)
+    fn scan_qr(&mut self, qr_data: &QRData) -> Result<(DeviceList, u8), GeneralError> {
+        verify_qr(&mut self.devices, qr_data)?;
+        Ok((self.devices.clone(), self.device_index))
     }
 
     fn receive_setup_msg(
@@ -883,19 +943,19 @@ impl DKGInternalState for DKGWaitForSigs {
         // Instance and threshold should be checked vs context in DKGNode.
 
         // Cannot handle joins or start in this state.
-        let DKGSetupSubMessage::Confirm(parties) = setup_msg.setup.message else {
-            return (self, Err(GeneralError::InvalidSetupMessage));
-        };
-
-        // New details must match exactly.
-        if !matches(&self.parties, &parties) {
+        if setup_msg.setup.msg_type != DKGSetupMessageType::Confirm {
             return (self, Err(GeneralError::InvalidSetupMessage));
         }
 
-        self.add_signature(setup_msg.party_id, setup_msg.sig.into_owned());
+        // New details must match exactly.
+        if !list_matches(&self.devices, setup_msg.setup.devices.as_ref()) {
+            return (self, Err(GeneralError::InvalidSetupMessage));
+        }
+
+        self.add_signature(setup_msg.device_index, setup_msg.sig.into_owned());
 
         if self.has_all_signatures() {
-            let ready = DKGReadyState::new(self.parties, self.party_id, ctx.threshold);
+            let ready = DKGReadyState::new(self.devices, self.device_index, ctx.threshold);
             (ready, Ok(false))
         } else {
             (self, Ok(false))
@@ -922,16 +982,16 @@ impl DKGInternalState for DKGWaitForSigs {
  *****************************************************************************/
 
 struct DKGReadyState {
-    parties: Arc<PartyList>,
-    party_id: u8,
+    devices: DeviceList,
+    device_index: u8,
     threshold: u8,
 }
 
 impl DKGReadyState {
-    fn new(parties: Arc<PartyList>, party_id: u8, threshold: u8) -> Box<Self> {
+    fn new(devices: DeviceList, device_index: u8, threshold: u8) -> Box<Self> {
         Box::new(Self {
-            parties,
-            party_id,
+            devices,
+            device_index,
             threshold,
         })
     }
@@ -939,57 +999,54 @@ impl DKGReadyState {
 
 impl DKGInternalState for DKGReadyState {
     fn get_state(&self) -> DKGState {
-        if self.parties.len() < self.threshold.into() {
+        if self.devices.len() < self.threshold.into() {
             DKGState::WaitForParties
         } else {
             DKGState::Ready
         }
     }
 
-    fn my_party_id(&self) -> Result<u8, GeneralError> {
-        Ok(self.party_id)
+    fn my_device_index(&self) -> Result<u8, GeneralError> {
+        Ok(self.device_index)
     }
 
-    fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
-        Ok(self.parties.clone())
+    fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
+        Ok((self.devices.clone(), self.device_index))
     }
 
     fn get_bytes_to_send(&self, ctx: &DKGContext) -> Result<Vec<u8>, GeneralError> {
-        let setup = DKGSetupMessage {
-            instance: Cow::Borrowed(&ctx.instance),
-            threshold: ctx.threshold,
-            message: DKGSetupSubMessage::Confirm(self.parties.clone()),
-        };
-        let msg = SignedDKGSetupMessage::sign(setup, self.party_id, &ctx.sk);
+        let msg = SignedDKGSetupMessage::make_confirm(&self.devices, self.device_index, &ctx);
         Ok(msg.to_bytes())
     }
 
-    fn scan_qr(&mut self, qr_data: QRData) -> Result<(), GeneralError> {
-        verify_qr(Arc::make_mut(&mut self.parties), &qr_data)
+    fn scan_qr(&mut self, qr_data: &QRData) -> Result<(DeviceList, u8), GeneralError> {
+        verify_qr(&mut self.devices, qr_data)?;
+        Ok((self.devices.clone(), self.device_index))
     }
 
     fn receive_setup_msg(
         mut self: Box<Self>,
         context: &DKGContext,
-        setup_msg: SignedDKGSetupMessage,
+        mut setup_msg: SignedDKGSetupMessage,
     ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
         // Instance and threshold should be checked vs context in DKGNode.
 
-        match setup_msg.setup.message {
-            DKGSetupSubMessage::Join(device) => {
-                // Assume sig is already verified.
-                Arc::make_mut(&mut self.parties).push(device.into_owned());
-                let state = DKGWaitForSigs::new(self.parties, self.party_id, context);
+        match setup_msg.setup.msg_type {
+            DKGSetupMessageType::Join => {
+                // Assume sig is already verified, and that index and length are correct.
+                self.devices
+                    .push(Arc::new(setup_msg.setup.devices.pop().unwrap().into()));
+                let state = DKGWaitForSigs::new(self.devices, self.device_index, context);
                 (state, Ok(true))
             }
 
-            DKGSetupSubMessage::Confirm(mut parties) => {
+            DKGSetupMessageType::Confirm => {
                 // Reject if parties somehow differ, since at this point all
                 // parties should have been confirmed.
-                if !is_prefix_of(&self.parties, &parties) {
+                if !list_prefix_matches(&self.devices, &setup_msg.setup.devices) {
                     return (self, Err(GeneralError::InvalidSetupMessage));
                 }
-                match parties.len() - self.parties.len() {
+                match setup_msg.setup.devices.len() - self.devices.len() {
                     0 => {
                         // Somehow got an extra confirmation message ?
                         return (self, Ok(false));
@@ -997,15 +1054,11 @@ impl DKGInternalState for DKGReadyState {
                     1 => {
                         // Got a confirmation before the join message.
                         // Just move to the wait for sigs state state.
-                        // Copy verification status from our current list.
-                        Arc::make_mut(&mut parties)
-                            .iter_mut()
-                            .zip(self.parties.iter())
-                            .for_each(|(p, q)| {
-                                p.verified = q.verified;
-                            });
-                        let mut state = DKGWaitForSigs::new(parties, self.party_id, context);
-                        state.add_signature(setup_msg.party_id, setup_msg.sig.into_owned());
+                        self.devices
+                            .push(Arc::new(setup_msg.setup.devices.pop().unwrap().into()));
+                        let mut state =
+                            DKGWaitForSigs::new(self.devices, self.device_index, context);
+                        state.add_signature(setup_msg.device_index, setup_msg.sig.into_owned());
                         return (state, Ok(true));
                     }
                     _ => {
@@ -1014,18 +1067,21 @@ impl DKGInternalState for DKGReadyState {
                     }
                 }
             }
-            DKGSetupSubMessage::Start(new_parties) => {
+            DKGSetupMessageType::Start => {
                 // Check details match
-                if !matches(&self.parties, &new_parties) {
+                if !list_matches(&self.devices, &setup_msg.setup.devices) {
                     return (self, Err(GeneralError::InvalidSetupMessage));
                 }
-                if self.parties.len() < context.threshold as usize {
+                if self.devices.len() < context.threshold as usize {
                     return (
                         self,
                         Err(GeneralError::InvalidState("Not enough parties".to_string())),
                     );
                 }
-                (DKGRunningState::new(self.parties, self.party_id), Ok(false))
+                (
+                    DKGRunningState::new(self.devices, self.device_index),
+                    Ok(false),
+                )
             }
         }
     }
@@ -1034,15 +1090,18 @@ impl DKGInternalState for DKGReadyState {
         self: Box<Self>,
         ctx: &DKGContext,
     ) -> (Box<dyn DKGInternalState>, Result<bool, GeneralError>) {
-        if self.parties.len() < ctx.threshold.into() {
+        if self.devices.len() < ctx.threshold.into() {
             (
                 self,
                 Err(GeneralError::InvalidState(
-                    "Not enough parties to start DKG.".to_string(),
+                    "Not enough devices to start DKG.".to_string(),
                 )),
             )
         } else {
-            (DKGRunningState::new(self.parties, self.party_id), Ok(true))
+            (
+                DKGRunningState::new(self.devices, self.device_index),
+                Ok(true),
+            )
         }
     }
 }
@@ -1053,13 +1112,16 @@ impl DKGInternalState for DKGReadyState {
  *****************************************************************************/
 
 struct DKGRunningState {
-    parties: Arc<PartyList>,
-    party_id: u8,
+    devices: DeviceList,
+    device_index: u8,
 }
 
 impl DKGRunningState {
-    fn new(parties: Arc<PartyList>, party_id: u8) -> Box<Self> {
-        Box::new(Self { parties, party_id })
+    fn new(devices: DeviceList, device_index: u8) -> Box<Self> {
+        Box::new(Self {
+            devices,
+            device_index,
+        })
     }
 }
 
@@ -1068,21 +1130,16 @@ impl DKGInternalState for DKGRunningState {
         DKGState::Running
     }
 
-    fn my_party_id(&self) -> Result<u8, GeneralError> {
-        Ok(self.party_id)
+    fn my_device_index(&self) -> Result<u8, GeneralError> {
+        Ok(self.device_index)
     }
 
-    fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
-        Ok(self.parties.clone())
+    fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
+        Ok((self.devices.clone(), self.device_index))
     }
 
     fn get_bytes_to_send(&self, ctx: &DKGContext) -> Result<Vec<u8>, GeneralError> {
-        let setup = DKGSetupMessage {
-            instance: Cow::Borrowed(&ctx.instance),
-            threshold: ctx.threshold,
-            message: DKGSetupSubMessage::Start(self.parties.clone()),
-        };
-        let msg = SignedDKGSetupMessage::sign(setup, self.party_id, &ctx.sk);
+        let msg = SignedDKGSetupMessage::make_start(&self.devices, self.device_index, &ctx);
         Ok(msg.to_bytes())
     }
 
@@ -1118,21 +1175,21 @@ impl DKGInternalState for DKGRunningState {
  *****************************************************************************/
 
 struct DKGFinishedState {
-    parties: Arc<PartyList>,
+    devices: DeviceList,
     result: Result<Keyshare, GeneralError>,
-    party_id: u8,
+    device_index: u8,
 }
 
 impl DKGFinishedState {
     fn new(
-        parties: Arc<PartyList>,
+        devices: DeviceList,
         result: Result<Keyshare, GeneralError>,
-        party_id: u8,
+        device_index: u8,
     ) -> Box<Self> {
         Box::new(Self {
-            parties,
+            devices,
             result,
-            party_id,
+            device_index,
         })
     }
 }
@@ -1142,12 +1199,12 @@ impl DKGInternalState for DKGFinishedState {
         DKGState::Finished
     }
 
-    fn get_party_list(&self) -> Result<Arc<PartyList>, GeneralError> {
-        Ok(self.parties.clone())
+    fn get_device_list(&self) -> Result<(DeviceList, u8), GeneralError> {
+        Ok((self.devices.clone(), self.device_index))
     }
 
-    fn my_party_id(&self) -> Result<u8, GeneralError> {
-        Ok(self.party_id)
+    fn my_device_index(&self) -> Result<u8, GeneralError> {
+        Ok(self.device_index)
     }
 
     fn receive_setup_msg(
@@ -1264,8 +1321,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_dkg_node_2_parties() {
-        println!("Starting DKG Node 2 Party Test");
+    async fn test_dkg_node_2_devices() {
+        println!("Starting DKG Node 2 Device Test");
         let instance = InstanceId::from_entropy();
 
         let setup_coord = InMemoryBridge::new();
@@ -1282,12 +1339,12 @@ mod tests {
         assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
-        let mut parties = tokio::task::JoinSet::new();
-        spawn_node(&mut parties, nodes[0].clone());
+        let mut devices = tokio::task::JoinSet::new();
+        spawn_node(&mut devices, nodes[0].clone());
 
         let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
-        assert_eq!(qr.party_id, 0);
+        assert_eq!(qr.device_index, 0);
         // TODO: check vk
 
         nodes.push(Arc::new(DKGNode::from_qr(
@@ -1299,7 +1356,7 @@ mod tests {
 
         assert_eq!(nodes[1].get_state(), DKGState::WaitForSetup);
         state_watchers.push(DKGStateReceiver::watch_node(&nodes[1]));
-        spawn_node(&mut parties, nodes[1].clone());
+        spawn_node(&mut devices, nodes[1].clone());
 
         // Wait for both nodes to become ready.
         for watcher in &mut state_watchers {
@@ -1307,10 +1364,10 @@ mod tests {
         }
 
         // Check verification status
-        assert!(nodes[0].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
-        assert!(nodes[1].get_party_list().unwrap()[0].verified);
-        assert!(nodes[1].get_party_list().unwrap()[1].verified);
+        assert!(nodes[0].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[1].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[0].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[1].verified);
 
         assert!(nodes[0].start_dkg().await.is_ok());
 
@@ -1325,15 +1382,15 @@ mod tests {
         assert_eq!(result1.0.party_id, 0);
         assert_eq!(result2.0.party_id, 1);
 
-        assert!(nodes[0].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
-        assert!(nodes[1].get_party_list().unwrap()[0].verified);
-        assert!(nodes[1].get_party_list().unwrap()[1].verified);
+        assert!(nodes[0].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[1].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[0].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[1].verified);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_dkg_node_3_parties() {
-        println!("Starting DKG Node 3 Party Test");
+    async fn test_dkg_node_3_devices() {
+        println!("Starting DKG Node 3 Device Test");
         let instance = InstanceId::from_entropy();
 
         let setup_coord = InMemoryBridge::new();
@@ -1350,12 +1407,12 @@ mod tests {
         assert_eq!(nodes[0].get_state(), DKGState::WaitForParties);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
-        let mut parties = tokio::task::JoinSet::new();
-        spawn_node(&mut parties, nodes[0].clone());
+        let mut devices = tokio::task::JoinSet::new();
+        spawn_node(&mut devices, nodes[0].clone());
 
         let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
-        assert_eq!(qr.party_id, 0);
+        assert_eq!(qr.device_index, 0);
         // TODO: check vk
 
         for i in 1..3 {
@@ -1367,7 +1424,7 @@ mod tests {
             )));
             assert_eq!(nodes[i].get_state(), DKGState::WaitForSetup);
             state_watchers.push(DKGStateReceiver::watch_node(&nodes[i]));
-            spawn_node(&mut parties, nodes[i].clone());
+            spawn_node(&mut devices, nodes[i].clone());
 
             // Wait for all nodes to become ready.
             let exp_state = if i < 2 {
@@ -1380,15 +1437,15 @@ mod tests {
             }
         }
 
-        assert!(nodes[0].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[2].verified);
-        assert!(nodes[1].get_party_list().unwrap()[0].verified);
-        assert!(nodes[1].get_party_list().unwrap()[1].verified);
-        assert!(!nodes[1].get_party_list().unwrap()[2].verified);
-        assert!(nodes[2].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[2].get_party_list().unwrap()[1].verified);
-        assert!(nodes[2].get_party_list().unwrap()[2].verified);
+        assert!(nodes[0].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[1].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[2].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[0].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[1].verified);
+        assert!(!nodes[1].get_device_list().unwrap().0[2].verified);
+        assert!(nodes[2].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[2].get_device_list().unwrap().0[1].verified);
+        assert!(nodes[2].get_device_list().unwrap().0[2].verified);
 
         // by now all nodes should be started and in ready state.
         // should be able to start DKG from any node.
@@ -1415,27 +1472,27 @@ mod tests {
             "All key IDs equal."
         );
 
-        assert!(nodes[0].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[1].verified);
-        assert!(!nodes[0].get_party_list().unwrap()[2].verified);
-        assert!(nodes[1].get_party_list().unwrap()[0].verified);
-        assert!(nodes[1].get_party_list().unwrap()[1].verified);
-        assert!(!nodes[1].get_party_list().unwrap()[2].verified);
-        assert!(nodes[2].get_party_list().unwrap()[0].verified);
-        assert!(!nodes[2].get_party_list().unwrap()[1].verified);
-        assert!(nodes[2].get_party_list().unwrap()[2].verified);
+        assert!(nodes[0].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[1].verified);
+        assert!(!nodes[0].get_device_list().unwrap().0[2].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[0].verified);
+        assert!(nodes[1].get_device_list().unwrap().0[1].verified);
+        assert!(!nodes[1].get_device_list().unwrap().0[2].verified);
+        assert!(nodes[2].get_device_list().unwrap().0[0].verified);
+        assert!(!nodes[2].get_device_list().unwrap().0[1].verified);
+        assert!(nodes[2].get_device_list().unwrap().0[2].verified);
     }
 
     #[test]
     fn test_join_wait_for_sigs() {
         let instance = InstanceId::from_entropy();
-        let (parties, party_sk) = make_sample_parties(2);
+        let (mut devices, device_sks) = make_sample_devices(2);
 
         let qr = QRData {
             instance: instance.clone(),
             threshold: 2,
-            party_id: 0,
-            vk: parties[0].vk.clone(),
+            device_index: 0,
+            vk: devices[0].vk.clone(),
         };
 
         let setup_if = InMemoryBridge::new();
@@ -1449,83 +1506,69 @@ mod tests {
             dkg_if.connect(),
         ));
 
-        // Construct message from parties that we are joining
-        let mut new_party_list = parties.clone();
-
-        // Make sure we add Node 3 to the list so it sees itself confirmed
-        let node3_vk = DeviceInfo::for_sk("Node3".to_string(), &node3.context.sk).vk;
-        let node3_dev = DeviceInfo {
-            friendly_name: "Node3".to_string(),
-            vk: node3_vk,
-            verified: true,
-        };
-        Arc::make_mut(&mut new_party_list).push(node3_dev);
+        devices.push(node3.context.dev.clone());
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(new_party_list.clone()),
-            },
-            0, // Signed by party 0
-            &party_sk[0],
+            DKGSetupMessage::make_confirm(&instance, 2, &devices),
+            0, // Signed by device 0
+            &device_sks[0],
         );
 
         let _ = node3.test_handle_setup_msg(msg).unwrap();
         assert_eq!(node3.get_state(), DKGState::WaitForSigs);
 
-        Arc::make_mut(&mut new_party_list)[0].verified = true;
-        Arc::make_mut(&mut new_party_list)[2].verified = true;
-        assert_eq!(node3.get_party_list().unwrap(), new_party_list);
+        Arc::make_mut(&mut devices[0]).verified = true;
+        Arc::make_mut(&mut devices[2]).verified = true;
+        assert_eq!(node3.get_device_list().unwrap().0, devices);
     }
 
     /*****************************************************************************
      * Test Helpers.
      *****************************************************************************/
 
-    fn make_sample_parties(n: u8) -> (Arc<PartyList>, Vec<Arc<NodeSecretKey>>) {
-        let party_sk = (0..n)
+    fn make_sample_devices(n: u8) -> (DeviceList, Vec<Arc<NodeSecretKey>>) {
+        let device_sks = (0..n)
             .map(|_| Arc::new(NodeSecretKey::from_entropy()))
             .collect::<Vec<_>>();
         (
-            Arc::new(
-                party_sk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, sk)| DeviceInfo::for_sk(format!("Dev{}", i).to_string(), sk))
-                    .collect::<PartyList>(),
-            ),
-            party_sk,
+            device_sks
+                .iter()
+                .enumerate()
+                .map(|(i, sk)| Arc::new(DeviceInfo::for_sk(format!("Dev{}", i).to_string(), sk)))
+                .collect::<DeviceList>(),
+            device_sks,
         )
     }
 
-    fn verify_parties(mut parties: Arc<PartyList>, id_list: &[usize]) -> Arc<PartyList> {
-        let mut mut_parties = Arc::make_mut(&mut parties);
+    fn verify_devices(mut devices: DeviceList, id_list: &[usize]) -> DeviceList {
         for id in id_list {
-            mut_parties[*id].verified = true;
+            Arc::make_mut(&mut devices[*id]).verified = true;
         }
-        parties
+        devices
     }
 
-    fn make_sample_setup(t: u8, n: u8) -> (DKGSetupMessage<'static>, Vec<Arc<NodeSecretKey>>) {
-        let (parties, party_sk) = make_sample_parties(n);
-        let setup = DKGSetupMessage {
+    fn make_sample_setup_msg(t: u8, n: u8) -> (DKGSetupMessage<'static>, Vec<Arc<NodeSecretKey>>) {
+        let device_sks = (0..n)
+            .map(|_| Arc::new(NodeSecretKey::from_entropy()))
+            .collect::<Vec<_>>();
+        let devices = device_sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| DeviceNetTransfer {
+                friendly_name: Cow::Owned(format!("Dev{}", i).to_string()),
+                vk: Cow::Owned(NodeVerifyingKey::from_sk(sk)),
+            })
+            .collect::<Vec<_>>();
+        let msg = DKGSetupMessage {
+            msg_type: DKGSetupMessageType::Confirm,
             instance: Cow::Owned(InstanceId::from_entropy()),
             threshold: t,
-            message: DKGSetupSubMessage::Confirm(parties),
+            devices,
         };
-        (setup, party_sk)
+        (msg, device_sks)
     }
 
-    fn make_test_context() -> DKGContext {
-        make_test_context_for_sk(NodeSecretKey::from_entropy())
-    }
-
-    fn make_test_context_for_sk(sk: NodeSecretKey) -> DKGContext {
-        DKGContext::new(InstanceId::from_entropy(), 2, "TestNode".to_string(), sk)
-    }
-
-    fn make_test_context_for_sk_arc(sk: &Arc<NodeSecretKey>) -> DKGContext {
+    fn make_test_context(sk: &Arc<NodeSecretKey>) -> DKGContext {
         DKGContext::new(
             InstanceId::from_entropy(),
             2,
@@ -1537,8 +1580,8 @@ mod tests {
     fn expect_sent_msg(
         state: &Box<dyn DKGInternalState>,
         ctx: &DKGContext,
-        exp_party_id: u8,
-        exp_parties: &PartyList,
+        exp_device_index: u8,
+        exp_devices: &DeviceList,
     ) {
         let sent_bytes = state.get_bytes_to_send(ctx).unwrap();
         let sent_msg = SignedDKGSetupMessage::try_from(sent_bytes.as_slice()).unwrap();
@@ -1552,13 +1595,19 @@ mod tests {
             sent_msg.setup.threshold, ctx.threshold,
             "Threshold mismatch"
         );
-        assert_eq!(sent_msg.party_id, exp_party_id, "Party ID mismatch");
-        let DKGSetupSubMessage::Confirm(parties) = sent_msg.setup.message else {
-            panic!("Expected Confirm message");
-        };
+        assert_eq!(
+            sent_msg.device_index, exp_device_index,
+            "Device Index mismatch"
+        );
+        assert_eq!(
+            sent_msg.setup.msg_type,
+            DKGSetupMessageType::Confirm,
+            "Expected Confirm message"
+        );
+
         assert!(
-            matches(parties.as_ref(), exp_parties),
-            "Party list mismatch"
+            list_matches(exp_devices, sent_msg.setup.devices.as_ref()),
+            "Device list mismatch"
         );
     }
 
@@ -1568,22 +1617,22 @@ mod tests {
 
     #[test]
     pub fn test_sign_dkg_setup_msg_ok() {
-        let (setup, party_sk) = make_sample_setup(3, 5);
-        let signed = SignedDKGSetupMessage::sign(setup, 1, &party_sk[1]);
+        let (setup, device_sks) = make_sample_setup_msg(3, 5);
+        let signed = SignedDKGSetupMessage::sign(setup, 1, &device_sks[1]);
         assert!(signed.verify().is_ok());
     }
 
     #[test]
     pub fn test_sign_dkg_setup_msg_wrong_id() {
-        let (setup, party_sk) = make_sample_setup(3, 5);
-        let signed = SignedDKGSetupMessage::sign(setup, 0, &party_sk[1]);
+        let (setup, device_sks) = make_sample_setup_msg(3, 5);
+        let signed = SignedDKGSetupMessage::sign(setup, 0, &device_sks[1]);
         assert!(signed.verify().is_err());
     }
 
     #[test]
     pub fn test_sign_dkg_setup_msg_invalid_id() {
-        let (setup, party_sk) = make_sample_setup(2, 3);
-        let signed = SignedDKGSetupMessage::sign(setup, 3, &party_sk[0]);
+        let (setup, device_sks) = make_sample_setup_msg(2, 3);
+        let signed = SignedDKGSetupMessage::sign(setup, 3, &device_sks[0]);
         assert!(signed.verify().is_err());
     }
 
@@ -1593,94 +1642,82 @@ mod tests {
 
     #[test]
     fn test_wait_for_net_receive_valid_setup() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[2]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[2]);
 
         let qr = QRData {
             instance: ctx.instance.clone(),
             threshold: 2,
-            party_id: 0,
-            vk: parties[0usize].vk.clone(),
+            device_index: 0,
+            vk: devices[0usize].vk.clone(),
         };
         let wait_state = DKGWaitForNetState::new(Arc::new(qr));
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             1,
-            &party_sk[1],
+            &device_sks[1],
         );
 
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
-        assert!(matches!(new_state.my_party_id(), Ok(2)));
-        expect_sent_msg(&new_state, &ctx, 2, &parties);
+        assert!(matches!(new_state.my_device_index(), Ok(2)));
+        expect_sent_msg(&new_state, &ctx, 2, &devices);
 
-        let exp_parties = verify_parties(parties, &[0, 2]);
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.as_ref(), exp_parties.as_ref());
+        let exp_devices = verify_devices(devices, &[0, 2]);
+        let new_setup_devices = new_state.get_device_list().unwrap().0;
+        assert_eq!(new_setup_devices.as_slice(), exp_devices.as_slice());
     }
 
     #[test]
-    fn test_wait_for_net_receive_valid_setup_2_parties() {
-        let (parties, party_sk) = make_sample_parties(2);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
+    fn test_wait_for_net_receive_valid_setup_2_devices() {
+        let (devices, device_sks) = make_sample_devices(2);
+        let ctx = make_test_context(&device_sks[1]);
 
         let qr = QRData {
             instance: ctx.instance.clone(),
             threshold: 2,
-            party_id: 0,
-            vk: parties[0usize].vk.clone(),
+            device_index: 0,
+            vk: devices[0usize].vk.clone(),
         };
         let wait_state = DKGWaitForNetState::new(Arc::new(qr));
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::Ready);
-        assert!(matches!(new_state.my_party_id(), Ok(1)));
-        expect_sent_msg(&new_state, &ctx, 1, &parties);
+        assert!(matches!(new_state.my_device_index(), Ok(1)));
+        expect_sent_msg(&new_state, &ctx, 1, &devices);
 
-        let exp_parties = verify_parties(parties, &[0, 1]);
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.as_ref(), exp_parties.as_ref());
+        let exp_devices = verify_devices(devices, &[0, 1]);
+        let new_setup_devices = new_state.get_device_list().unwrap().0;
+        assert_eq!(new_setup_devices.as_slice(), exp_devices.as_slice());
     }
 
     #[test]
     fn test_wait_for_net_receive_invalid_setup() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[2]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[2]);
 
         let qr = QRData {
             instance: ctx.instance.clone(),
             threshold: 2,
-            party_id: 0,
-            vk: parties[0usize].vk.clone(),
+            device_index: 0,
+            vk: devices[0usize].vk.clone(),
         };
         let wait_state = DKGWaitForNetState::new(Arc::new(qr));
 
         let other_instance = InstanceId::from_entropy();
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&other_instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&other_instance, 2, &devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
@@ -1694,31 +1731,27 @@ mod tests {
 
     #[test]
     fn test_wait_for_sigs_basics() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let parties = verify_parties(parties, &[0, 1]);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
-        let wait_state: Box<dyn DKGInternalState> = DKGWaitForSigs::new(parties.clone(), 1, &ctx);
+        let (devices, device_sks) = make_sample_devices(3);
+        let devices = verify_devices(devices, &[0, 1]);
+        let ctx = make_test_context(&device_sks[1]);
+        let wait_state: Box<dyn DKGInternalState> = DKGWaitForSigs::new(devices.clone(), 1, &ctx);
         assert_eq!(wait_state.get_state(), DKGState::WaitForSigs);
-        assert_eq!(wait_state.get_party_list().unwrap(), parties);
-        assert_eq!(wait_state.my_party_id().unwrap(), 1);
-        expect_sent_msg(&wait_state, &ctx, 1, &parties);
+        assert_eq!(wait_state.get_device_list().unwrap(), (devices.clone(), 1));
+        assert_eq!(wait_state.my_device_index().unwrap(), 1);
+        expect_sent_msg(&wait_state, &ctx, 1, &devices);
     }
 
     #[test]
-    fn test_wait_for_sigs_receive_invalid_party_list() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
-        let wait_state = DKGWaitForSigs::new(parties.clone(), 1, &ctx);
+    fn test_wait_for_sigs_receive_invalid_device_list() {
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[1]);
+        let wait_state = DKGWaitForSigs::new(devices.clone(), 1, &ctx);
 
-        let (bad_parties, _) = make_sample_parties(3); // Different parties
+        let (bad_devices, _) = make_sample_devices(3); // Different devices
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(bad_parties),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &bad_devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
@@ -1728,53 +1761,46 @@ mod tests {
 
     #[test]
     fn test_wait_for_sigs_receive_setup_ok() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
-        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[1]);
+        let verified_devices = verify_devices(devices.clone(), &[0, 1]);
         // This creates a state where we are the only ones to have signed.
-        let wait_state = DKGWaitForSigs::new(verified_parties.clone(), 1, &ctx);
+        let wait_state = DKGWaitForSigs::new(verified_devices.clone(), 1, &ctx);
 
-        // Receive party 2 signature.
+        // Receive device 2 signature.
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             2,
-            &party_sk[2],
+            &device_sks[2],
         );
 
         let (new_state, res) = wait_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
 
-        // make sure verified parties are set correctly
-        let final_parties = new_state.get_party_list().unwrap();
-        assert!(final_parties[0].verified);
-        assert!(final_parties[1].verified);
-        assert!(!final_parties[2].verified);
+        // make sure verified devices are set correctly
+        // make sure verified devices are set correctly
+        let final_devices = new_state.get_device_list().unwrap().0;
+        assert!(final_devices[0].verified);
+        assert!(final_devices[1].verified);
+        assert!(!final_devices[2].verified);
 
-        // Receive party 0 signature.
+        // Receive device 0 signature.
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = new_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::Ready);
 
-        // make sure verified parties are set correctly
-        let final_parties = new_state.get_party_list().unwrap();
-        assert!(final_parties[0].verified);
-        assert!(final_parties[1].verified);
-        assert!(!final_parties[2].verified);
+        // make sure verified devices are set correctly
+        let final_devices = new_state.get_device_list().unwrap().0;
+        assert!(final_devices[0].verified);
+        assert!(final_devices[1].verified);
+        assert!(!final_devices[2].verified);
     }
 
     /*****************************************************************************
@@ -1783,32 +1809,28 @@ mod tests {
 
     #[test]
     fn test_ready_state_basics() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
-        let ready_state: Box<dyn DKGInternalState> = DKGReadyState::new(parties.clone(), 1, 2);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[1]);
+        let ready_state: Box<dyn DKGInternalState> = DKGReadyState::new(devices.clone(), 1, 2);
         assert_eq!(ready_state.get_state(), DKGState::Ready);
-        assert_eq!(ready_state.get_party_list().unwrap(), parties);
-        assert_eq!(ready_state.my_party_id().unwrap(), 1);
-        expect_sent_msg(&ready_state, &ctx, 1, &parties);
+        assert_eq!(ready_state.get_device_list().unwrap(), (devices.clone(), 1));
+        assert_eq!(ready_state.my_device_index().unwrap(), 1);
+        expect_sent_msg(&ready_state, &ctx, 1, &devices);
     }
 
     #[test]
-    fn test_ready_receive_setup_consistency_incompatible_party_list_shorter() {
+    fn test_ready_receive_setup_consistency_incompatible_device_list_shorter() {
         let instance = InstanceId::from_entropy();
-        let (parties, party_sk) = make_sample_parties(3);
-        let ready_state = DKGReadyState::new(parties.clone(), 1, 2);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ready_state = DKGReadyState::new(devices.clone(), 1, 2);
+        let ctx = make_test_context(&device_sks[1]);
 
-        let mut short_parties = parties.clone();
-        Arc::make_mut(&mut short_parties).pop();
+        let mut short_devices = devices.clone();
+        short_devices.pop();
         let bad_msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(short_parties),
-            },
+            DKGSetupMessage::make_confirm(&instance, 2, &short_devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, bad_msg);
         assert!(matches!(res, Err(GeneralError::InvalidSetupMessage)));
@@ -1816,21 +1838,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_receive_setup_consistency_incompatible_party_list_different() {
+    fn test_ready_receive_setup_consistency_incompatible_device_list_different() {
         let instance = InstanceId::from_entropy();
-        let (parties, party_sk) = make_sample_parties(3);
-        let ready_state = DKGReadyState::new(parties.clone(), 1, 2);
-        let ctx = make_test_context_for_sk_arc(&party_sk[1]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ready_state = DKGReadyState::new(devices.clone(), 1, 2);
+        let ctx = make_test_context(&device_sks[1]);
 
-        let (different_parties, _) = make_sample_parties(3);
+        let (different_devices, _) = make_sample_devices(3);
         let bad_msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(different_parties),
-            },
+            DKGSetupMessage::make_confirm(&instance, 2, &different_devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, bad_msg);
@@ -1839,62 +1857,44 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_receive_setup_add_party() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
+    fn test_ready_receive_setup_add_device() {
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
 
-        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
-        let short_parties = Arc::new(
-            verified_parties[..verified_parties.len() as usize - 1]
-                .iter()
-                .cloned()
-                .collect::<PartyList>(),
-        );
-        let ready_state = DKGReadyState::new(short_parties.clone(), 0, 2);
+        let devices = verify_devices(devices, &[0, 1]);
+        let short_devices = devices[..devices.len() - 1].to_vec();
+        let ready_state = DKGReadyState::new(short_devices, 0, 2);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             1,
-            &party_sk[1],
+            &device_sks[1],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
 
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.len(), 3);
-        assert_eq!(new_setup_parties.as_ref(), verified_parties.as_ref());
+        let (new_setup_devices, new_id) = new_state.get_device_list().unwrap();
+        assert_eq!(new_id, 0);
+        assert_eq!(new_setup_devices, devices);
 
-        expect_sent_msg(&new_state, &ctx, 0, &parties);
+        expect_sent_msg(&new_state, &ctx, 0, &devices);
     }
 
     #[test]
-    fn test_ready_receive_setup_join_many_parties() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
+    fn test_ready_receive_setup_join_many_devices() {
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
 
-        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
-        let short_parties = Arc::new(
-            verified_parties[..verified_parties.len() as usize - 1]
-                .iter()
-                .cloned()
-                .collect::<PartyList>(),
-        );
-        let ready_state = DKGReadyState::new(short_parties.clone(), 0, 2);
+        let devices = verify_devices(devices, &[0, 1]);
+        let short_devices = devices[..devices.len() - 1].to_vec();
+        let ready_state = DKGReadyState::new(short_devices, 0, 2);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Join(Cow::Borrowed(&parties[2])),
-            },
+            DKGSetupMessage::make_join(&ctx.instance, 2, &devices[2]),
             0,
-            &party_sk[2],
+            &device_sks[2],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
@@ -1902,29 +1902,27 @@ mod tests {
         assert!(matches!(res, Ok(true)));
         assert_eq!(new_state.get_state(), DKGState::WaitForSigs);
 
-        expect_sent_msg(&new_state, &ctx, 0, &parties);
+        expect_sent_msg(&new_state, &ctx, 0, &devices);
 
-        let new_setup_parties = new_state.get_party_list().unwrap();
-        assert_eq!(new_setup_parties.len(), 3);
-        assert_eq!(new_setup_parties.as_ref(), verified_parties.as_ref());
+        let (new_setup_devices, new_id) = new_state.get_device_list().unwrap();
+        assert_eq!(new_id, 0);
+        assert_eq!(new_setup_devices, devices);
+
+        expect_sent_msg(&new_state, &ctx, 0, &devices);
     }
 
     #[test]
-    fn test_ready_receive_setup_start_not_enough_parties() {
-        let (parties, party_sk) = make_sample_parties(2);
-        let mut ctx = make_test_context_for_sk_arc(&party_sk[1]);
+    fn test_ready_receive_setup_start_not_enough_devices() {
+        let (devices, device_sks) = make_sample_devices(2);
+        let mut ctx = make_test_context(&device_sks[1]);
         ctx.threshold = 3;
         let instance = &ctx.instance;
-        let ready_state = DKGReadyState::new(parties.clone(), 1, 3);
+        let ready_state = DKGReadyState::new(devices.clone(), 1, 3);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&instance),
-                threshold: 3,
-                message: DKGSetupSubMessage::Start(parties.clone()),
-            },
+            DKGSetupMessage::make_start(&instance, 3, &devices),
             0,
-            &party_sk[0],
+            &device_sks[0],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
@@ -1934,26 +1932,23 @@ mod tests {
 
     #[test]
     fn test_ready_receive_setup_start_success() {
-        let (parties, party_sk) = make_sample_parties(2);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let verified_parties = verify_parties(parties.clone(), &[0, 1]);
-        let ready_state = DKGReadyState::new(verified_parties.clone(), 0, 2);
+        let (devices, device_sks) = make_sample_devices(2);
+        let ctx = make_test_context(&device_sks[0]);
+        let devices = verify_devices(devices, &[0, 1]);
+        let ready_state = DKGReadyState::new(devices.clone(), 0, 2);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Start(parties.clone()),
-            },
+            DKGSetupMessage::make_start(&ctx.instance, 2, &devices),
             1,
-            &party_sk[1],
+            &device_sks[1],
         );
 
         let (new_state, res) = ready_state.receive_setup_msg(&ctx, msg);
         assert!(matches!(res, Ok(false)));
         assert_eq!(new_state.get_state(), DKGState::Running);
-        let new_party_list = new_state.get_party_list().unwrap();
-        assert_eq!(new_party_list.as_ref(), verified_parties.as_ref());
+        let (new_setup_devices, new_id) = new_state.get_device_list().unwrap();
+        assert_eq!(new_id, 0);
+        assert_eq!(new_setup_devices, devices);
     }
 
     /*****************************************************************************
@@ -1962,12 +1957,13 @@ mod tests {
 
     #[test]
     fn test_running_state_basics() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let running_state = DKGRunningState::new(parties.clone(), 0);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
+        let running_state = DKGRunningState::new(devices.clone(), 0);
         assert_eq!(running_state.get_state(), DKGState::Running);
-        assert_eq!(running_state.get_party_list().unwrap(), parties.clone());
-        assert_eq!(running_state.my_party_id().unwrap(), 0);
+        let (new_setup_devices, new_id) = running_state.get_device_list().unwrap();
+        assert_eq!(new_id, 0);
+        assert_eq!(new_setup_devices, devices);
 
         let sent_bytes = running_state.get_bytes_to_send(&ctx).unwrap();
         let sent_msg = SignedDKGSetupMessage::try_from(sent_bytes.as_slice()).unwrap();
@@ -1981,32 +1977,27 @@ mod tests {
             sent_msg.setup.threshold, ctx.threshold,
             "Threshold mismatch"
         );
-        assert_eq!(sent_msg.party_id, 0, "Party ID mismatch");
-        let DKGSetupSubMessage::Start(sent_parties) = sent_msg.setup.message else {
+        assert_eq!(sent_msg.device_index, 0, "Device Index mismatch");
+        if sent_msg.setup.msg_type != DKGSetupMessageType::Start {
             panic!("Expected Start message");
         };
-        assert_eq!(
-            sent_parties.as_ref(),
-            parties.as_ref(),
-            "Party list mismatch"
+        assert!(
+            list_matches(&devices, &sent_msg.setup.devices),
+            "Device list mismatch"
         );
     }
 
     #[test]
     fn test_running_state_rejects_receive_setup() {
         // This should never happen, but good to make sure it doesn't crash or something.
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let running_state = DKGRunningState::new(parties.clone(), 0);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
+        let running_state = DKGRunningState::new(devices.clone(), 0);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             1,
-            &party_sk[1],
+            &device_sks[1],
         );
 
         let (new_state, res) = running_state.receive_setup_msg(&ctx, msg);
@@ -2016,9 +2007,9 @@ mod tests {
 
     #[test]
     fn test_running_state_rejects_start_dkg() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
-        let running_state = DKGRunningState::new(parties.clone(), 0);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
+        let running_state = DKGRunningState::new(devices.clone(), 0);
         let (new_state, res) = running_state.start_dkg(&ctx);
         assert!(matches!(res, Err(GeneralError::InvalidState(_))));
         assert_eq!(new_state.get_state(), DKGState::Running);
@@ -2030,12 +2021,15 @@ mod tests {
 
     #[test]
     fn test_finished_state_basics() {
-        let (parties, _) = make_sample_parties(3);
+        let (devices, _) = make_sample_devices(3);
         let finished_state =
-            DKGFinishedState::new(parties.clone(), Err(GeneralError::Cancelled), 0);
+            DKGFinishedState::new(devices.clone(), Err(GeneralError::Cancelled), 0);
         assert_eq!(finished_state.get_state(), DKGState::Finished);
-        assert_eq!(finished_state.get_party_list().unwrap(), parties.clone());
-        assert_eq!(finished_state.my_party_id().unwrap(), 0);
+        assert_eq!(
+            finished_state.get_device_list().unwrap(),
+            (devices.clone(), 0)
+        );
+        assert_eq!(finished_state.my_device_index().unwrap(), 0);
         assert!(matches!(
             finished_state.get_result(),
             Err(GeneralError::Cancelled)
@@ -2045,19 +2039,15 @@ mod tests {
     #[test]
     fn test_finished_state_rejects_receive_setup() {
         // This should never happen, but good to make sure it doesn't crash or something.
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
         let finished_state =
-            DKGFinishedState::new(parties.clone(), Err(GeneralError::Cancelled), 0);
+            DKGFinishedState::new(devices.clone(), Err(GeneralError::Cancelled), 0);
 
         let msg = SignedDKGSetupMessage::sign(
-            DKGSetupMessage {
-                instance: Cow::Borrowed(&ctx.instance),
-                threshold: 2,
-                message: DKGSetupSubMessage::Confirm(parties.clone()),
-            },
+            DKGSetupMessage::make_confirm(&ctx.instance, 2, &devices),
             1,
-            &party_sk[1],
+            &device_sks[1],
         );
 
         let (new_state, res) = finished_state.receive_setup_msg(&ctx, msg);
@@ -2067,10 +2057,10 @@ mod tests {
 
     #[test]
     fn test_finished_state_rejects_start_dkg() {
-        let (parties, party_sk) = make_sample_parties(3);
-        let ctx = make_test_context_for_sk_arc(&party_sk[0]);
+        let (devices, device_sks) = make_sample_devices(3);
+        let ctx = make_test_context(&device_sks[0]);
         let finished_state =
-            DKGFinishedState::new(parties.clone(), Err(GeneralError::Cancelled), 0);
+            DKGFinishedState::new(devices.clone(), Err(GeneralError::Cancelled), 0);
         let (new_state, res) = finished_state.start_dkg(&ctx);
         assert!(matches!(res, Err(GeneralError::InvalidState(_))));
         assert_eq!(new_state.get_state(), DKGState::Finished);

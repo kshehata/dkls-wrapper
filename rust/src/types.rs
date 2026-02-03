@@ -332,8 +332,8 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for ArcVerifier<T> {
 pub struct DeviceInfo {
     pub friendly_name: String,
     pub vk: NodeVerifyingKey,
-    // Verified field is never serialized.
-    #[serde(skip, default)]
+    // Whether we have scanned the QR code for this device.
+    #[serde(default)]
     pub verified: bool,
 }
 
