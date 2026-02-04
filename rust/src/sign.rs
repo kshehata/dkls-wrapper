@@ -534,10 +534,9 @@ impl SignNode {
 #[cfg(test)]
 mod tests {
     use crate::net::InMemoryBridge;
+    use crate::test::*;
 
     use super::*;
-    use sl_dkls23::keygen::run as keygen_run;
-    use sl_dkls23::setup::keygen::SetupMessage as KeygenSetup;
 
     #[test]
     pub fn test_sig_req() {
@@ -606,65 +605,10 @@ mod tests {
         assert!(start_msg.check_sigs().is_ok());
     }
 
-    //helper function to generate the keyshares for the sign protocol
-    pub async fn gen_keyshares(
-        t: u8,
-        n: u8,
-    ) -> (
-        Vec<Arc<NodeSecretKey>>,
-        Vec<NodeVerifyingKey>,
-        Vec<Keyshare>,
-    ) {
-        let instance = InstanceId::from_entropy();
-        let party_sk = (0..n)
-            .map(|_| Arc::new(NodeSecretKey::from_entropy()))
-            .collect::<Vec<_>>();
-        let party_vk = party_sk
-            .iter()
-            .map(|sk| NodeVerifyingKey::from_sk(sk))
-            .collect::<Vec<_>>();
-        let ranks = vec![0u8; n as usize];
-
-        let setup_msgs = party_sk
-            .iter()
-            .enumerate()
-            .map(|(i, sk)| {
-                KeygenSetup::new(
-                    instance.into(),
-                    sk.as_ref().clone(),
-                    i as usize,
-                    party_vk.clone(),
-                    &ranks,
-                    t as usize,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let coord = sl_mpc_mate::coord::SimpleMessageRelay::new();
-        let mut parties = tokio::task::JoinSet::new();
-
-        for setup in setup_msgs {
-            parties.spawn({
-                let relay = coord.connect();
-                let mut rng = ChaCha20Rng::from_entropy();
-                keygen_run(setup, rng.gen(), relay)
-            });
-        }
-
-        // Gather the key shares.
-        let shares = parties
-            .join_all()
-            .await
-            .into_iter()
-            .map(|r| Keyshare(Arc::new(r.unwrap())))
-            .collect::<Vec<_>>();
-
-        (party_sk, party_vk, shares)
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing_manual() {
-        let (party_sk, _party_vk, shares) = gen_keyshares(2, 3).await;
+        let shares = gen_keyshares_async(2, 3).await;
+        let party_sk = gen_random_keys(3);
 
         // Value to be signed
         let message = "Hello World";
@@ -738,7 +682,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing() {
         let (t, n) = (3usize, 5usize);
-        let (party_sk, _party_vk, shares) = gen_keyshares(t as u8, n as u8).await;
+        let shares = gen_keyshares_async(t, n).await;
+        let party_sk = gen_random_keys(n as u8);
 
         // Value to be signed
         let message = "Hello World";
@@ -788,7 +733,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing_shortcuts() {
         let (t, n) = (3usize, 5usize);
-        let (party_sk, _party_vk, shares) = gen_keyshares(t as u8, n as u8).await;
+        let shares = gen_keyshares_async(t, n).await;
+        let party_sk = gen_random_keys(n as u8);
 
         // Value to be signed
         let message = "Hello World";
