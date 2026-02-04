@@ -261,16 +261,11 @@ impl SignRequest {
 /*****************************************************************************
  * Support structs for SignNode.
  *****************************************************************************/
-pub struct SignNodeContext {
-    pub my_vk: NodeVerifyingKey,
-    pub secret_key: Arc<NodeSecretKey>,
-    pub keyshare: Keyshare,
-}
 
 // Helper to do the actual signature for a given request using the context
 // and relay. Made general for testing.
 pub async fn do_sign_relay<R: Relay>(
-    ctx: Arc<SignNodeContext>,
+    ctx: Arc<DeviceLocalData>,
     req: SignRequest,
     party_id: usize,
     relay: R,
@@ -278,7 +273,7 @@ pub async fn do_sign_relay<R: Relay>(
     let hash = req.get_msg_hash();
     let setup_msg = SignSetupMessage::new(
         req.instance.into(),
-        ctx.secret_key.as_ref(),
+        &ctx.sk,
         party_id,
         req.party_vk,
         ctx.keyshare.0.clone(),
@@ -292,23 +287,20 @@ pub async fn do_sign_relay<R: Relay>(
 // Encapsulate a signing session originating from us.
 // Waits for others to join and then sends start.
 pub struct SignOriginatingSession {
-    pub ctx: Arc<SignNodeContext>,
+    pub ctx: Arc<DeviceLocalData>,
     pub req: SignRequest,
 }
 
 impl SignOriginatingSession {
     /// Make a session for a new request to sign the given bytes.
-    pub fn from_bytes(ctx: Arc<SignNodeContext>, bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(ctx: Arc<DeviceLocalData>, bytes: Vec<u8>) -> Self {
         let instance = InstanceId::from_entropy();
-        let req = SignRequest::for_message_bytes(&instance, bytes, &ctx.my_vk, &ctx.secret_key);
-        Self {
-            ctx: ctx.clone(),
-            req,
-        }
+        let req = SignRequest::for_message_bytes(&instance, bytes, ctx.my_vk(), &ctx.sk);
+        Self { ctx, req }
     }
 
     /// Make a session for a new request to sign the given string.
-    pub fn from_string(ctx: Arc<SignNodeContext>, string: &str) -> Self {
+    pub fn from_string(ctx: Arc<DeviceLocalData>, string: &str) -> Self {
         Self::from_bytes(ctx, string.as_bytes().to_vec())
     }
 
@@ -324,13 +316,13 @@ impl SignOriginatingSession {
         let reply = SignRequest::try_from(reply_bytes)?;
         reply.check_sigs()?;
         self.req.update(reply)?;
-        Ok(self.req.party_vk.len() >= self.ctx.keyshare.threshold() as usize)
+        Ok(self.req.party_vk.len() >= self.ctx.threshold() as usize)
     }
 
     // If we've gotten enough other parties to join, this produces the
     // message telling them which parties are involved.
     pub fn get_start_bytes(&mut self) -> Result<Vec<u8>, GeneralError> {
-        if self.req.party_vk.len() < self.ctx.keyshare.threshold() as usize {
+        if self.req.party_vk.len() < self.ctx.threshold() as usize {
             return Err(GeneralError::InvalidInput("Not enough parties".to_string()));
         }
         Ok(self.req.get_start_bytes())
@@ -363,7 +355,7 @@ impl SignOriginatingSession {
 // Encapsulation of joining signing session originated by another party.
 // Sends out our joining message and then waits for the start before signing.
 pub struct SignReplySession {
-    pub ctx: Arc<SignNodeContext>,
+    pub ctx: Arc<DeviceLocalData>,
     pub req: Arc<SignRequest>,
 }
 
@@ -372,22 +364,19 @@ impl SignReplySession {
     /// If the request is valid, create a session for joining it.
     /// If the request is invalid, returns an error.
     pub fn join_request(
-        ctx: Arc<SignNodeContext>,
+        ctx: Arc<DeviceLocalData>,
         req: Arc<SignRequest>,
     ) -> Result<Self, GeneralError> {
         if req.message.is_empty() {
             return Err(GeneralError::InvalidInput("No message".to_string()));
         }
         req.check_sigs()?;
-        Ok(Self {
-            ctx: ctx.clone(),
-            req,
-        })
+        Ok(Self { ctx, req })
     }
 
     pub fn get_reply_bytes(&self) -> Vec<u8> {
         self.req
-            .get_join_reply(&self.ctx.my_vk, &self.ctx.secret_key)
+            .get_join_reply(&self.ctx.my_vk(), &self.ctx.sk)
             .to_bytes()
     }
 
@@ -395,13 +384,13 @@ impl SignReplySession {
     // with the same VK, and has ours somewhere.
     pub fn check_start_msg(&self, msg: &SignRequest) -> Result<u8, GeneralError> {
         self.req.check_msg(msg)?;
-        if msg.party_vk.len() < self.ctx.keyshare.threshold() as usize {
+        if msg.party_vk.len() < self.ctx.threshold() as usize {
             return Err(GeneralError::InvalidInput("Not enough parties".to_string()));
         }
         if msg.party_vk.first() != self.req.party_vk.first() {
             return Err(GeneralError::InvalidInput("Party VK mismatch".to_string()));
         }
-        let Some(party_id) = msg.party_vk.iter().position(|vk| vk == &self.ctx.my_vk) else {
+        let Some(party_id) = msg.party_vk.iter().position(|vk| vk == self.ctx.my_vk()) else {
             return Err(GeneralError::InvalidInput("Our VK not in list".to_string()));
         };
 
@@ -459,7 +448,7 @@ impl SignReplySession {
 
 #[derive(Clone, uniffi::Object)]
 pub struct SignNode {
-    ctx: Arc<SignNodeContext>,
+    ctx: Arc<DeviceLocalData>,
 }
 
 impl SignNode {
@@ -484,14 +473,8 @@ impl SignNode {
 #[uniffi::export]
 impl SignNode {
     #[uniffi::constructor]
-    pub fn new(secret_key: Arc<NodeSecretKey>, keyshare: &Keyshare) -> Self {
-        Self {
-            ctx: Arc::new(SignNodeContext {
-                my_vk: NodeVerifyingKey::from_sk(&secret_key),
-                secret_key,
-                keyshare: keyshare.clone(),
-            }),
-        }
+    pub fn new(ctx: Arc<DeviceLocalData>) -> Self {
+        Self { ctx }
     }
 
     // Get the next signing request from the network interface.
@@ -607,17 +590,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing_manual() {
-        let shares = gen_keyshares_async(2, 3).await;
-        let party_sk = gen_random_keys(3);
+        let ctxs = gen_local_data_async(2, 3).await;
 
         // Value to be signed
         let message = "Hello World";
-        let vk = shares[0].vk();
+        let vk = ctxs[0].keyshare.vk();
 
-        let nodes = party_sk
+        let nodes = ctxs
             .into_iter()
-            .zip(shares)
-            .map(|(sk, share)| SignNode::new(sk, &share))
+            .map(|ctx| SignNode::new(ctx))
             .collect::<Vec<_>>();
 
         // Node 0 generates a signing request and sends to all others.
@@ -682,17 +663,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing() {
         let (t, n) = (3usize, 5usize);
-        let shares = gen_keyshares_async(t, n).await;
-        let party_sk = gen_random_keys(n as u8);
+        let ctxs = gen_local_data_async(t as u8, n as u8).await;
 
         // Value to be signed
         let message = "Hello World";
-        let vk = shares[0].vk();
+        let vk = ctxs[0].keyshare.vk();
 
-        let nodes = party_sk
+        let nodes = ctxs
             .into_iter()
-            .zip(shares)
-            .map(|(sk, share)| SignNode::new(sk, &share))
+            .map(|ctx| SignNode::new(ctx))
             .collect::<Vec<_>>();
 
         // Node 0 generates a signing request and sends to all others.
@@ -733,17 +712,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_signing_shortcuts() {
         let (t, n) = (3usize, 5usize);
-        let shares = gen_keyshares_async(t, n).await;
-        let party_sk = gen_random_keys(n as u8);
+        let ctxs = gen_local_data_async(t as u8, n as u8).await;
 
         // Value to be signed
         let message = "Hello World";
-        let vk = shares[0].vk();
+        let vk = ctxs[0].keyshare.vk();
 
-        let mut nodes = party_sk
+        let mut nodes = ctxs
             .into_iter()
-            .zip(shares)
-            .map(|(sk, share)| SignNode::new(sk, &share))
+            .map(|ctx| SignNode::new(ctx))
             .collect::<Vec<_>>();
 
         // Node 0 generates a signing request and sends to all others.

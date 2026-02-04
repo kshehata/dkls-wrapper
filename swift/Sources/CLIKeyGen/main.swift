@@ -254,11 +254,11 @@ print(colorize("Waiting for DKG to complete...", .yellow))
 await messageLoopTask.value
 
 do {
-    let share = try dkgNode.getResult()
-    share.print()
+    let localData = try dkgNode.getLocalData()
+    // localData.keyshare.print()
     // print(colorize("Key share bytes: \(share.toBytes().count) bytes", .magenta))
-    try share.toBytes().write(to: URL(fileURLWithPath: outputFilename))
-    print(colorize("✓ Key share written to \(outputFilename)", .green))
+    try localData.toBytes().write(to: URL(fileURLWithPath: outputFilename))
+    print(colorize("✓ Device local data written to \(outputFilename)", .green))
 } catch {
     print(colorize("Error: \(error)", .red))
 }

@@ -74,10 +74,7 @@ pub struct Keyshare(pub Arc<sl_dkls23::keygen::Keyshare>);
 impl Keyshare {
     #[uniffi::constructor]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
-        let inner = sl_dkls23::keygen::Keyshare::from_bytes(bytes).ok_or(
-            GeneralError::InvalidInput("Invalid KeyShare encoding".to_string()),
-        )?;
-        Ok(Self(Arc::new(inner)))
+        Self::try_from(bytes)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -105,6 +102,40 @@ impl Keyshare {
             .into()
     }
 }
+
+impl TryFrom<&[u8]> for Keyshare {
+    type Error = GeneralError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let inner = sl_dkls23::keygen::Keyshare::from_bytes(value).ok_or(
+            GeneralError::InvalidInput("Invalid Keyshare encoding".to_string()),
+        )?;
+        Ok(Self(Arc::new(inner)))
+    }
+}
+
+impl Serialize for Keyshare {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.to_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for Keyshare {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Self::try_from(bytes.as_slice()).map_err(serde::de::Error::custom)
+    }
+}
+
+/*****************************************************************************
+ * Signatures.
+ *****************************************************************************/
 
 #[derive(Debug, Clone, PartialEq, uniffi::Object)]
 pub struct Signature(pub k256::ecdsa::Signature);
@@ -151,7 +182,7 @@ impl Signature {
 }
 
 /*****************************************************************************
- * Keys for signing messages.
+ * Signing Keys.
  *****************************************************************************/
 
 #[derive(Clone, uniffi::Object)]
@@ -174,16 +205,24 @@ impl NodeSecretKey {
 
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
-        let inner = SigningKey::try_from(bytes.as_slice())
-            .map_err(|_| GeneralError::InvalidInput("Invalid sk encoding".to_string()))?;
-        Ok(Self {
-            inner,
-            bytes: bytes.into_boxed_slice(),
-        })
+        Self::try_from(bytes.as_slice())
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         self.bytes.to_vec()
+    }
+}
+
+impl TryFrom<&[u8]> for NodeSecretKey {
+    type Error = GeneralError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let inner = SigningKey::try_from(value)
+            .map_err(|_| GeneralError::InvalidInput("Invalid sk encoding".to_string()))?;
+        Ok(Self {
+            inner,
+            bytes: Box::from(value),
+        })
     }
 }
 
@@ -210,6 +249,29 @@ impl Signer<k256::ecdsa::Signature> for &NodeSecretKey {
         self.inner.try_sign(msg)
     }
 }
+
+impl Serialize for NodeSecretKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.to_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeSecretKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        NodeSecretKey::from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/*****************************************************************************
+ * Verifying Keys.
+ *****************************************************************************/
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Object)]
 pub struct NodeVerifyingKey {
@@ -239,12 +301,7 @@ impl NodeVerifyingKey {
 
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
-        let inner = VerifyingKey::try_from(bytes.as_slice())
-            .map_err(|_| GeneralError::InvalidInput("Invalid vk encoding".to_string()))?;
-        Ok(Self {
-            inner,
-            bytes: bytes.into_boxed_slice(),
-        })
+        Self::try_from(bytes.as_slice())
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -255,6 +312,19 @@ impl NodeVerifyingKey {
         self.inner
             .verify(msg, &sig.0)
             .map_err(|e| GeneralError::SignatureError(e.to_string()))
+    }
+}
+
+impl TryFrom<&[u8]> for NodeVerifyingKey {
+    type Error = GeneralError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let inner = VerifyingKey::try_from(value)
+            .map_err(|_| GeneralError::InvalidInput("Invalid vk encoding".to_string()))?;
+        Ok(Self {
+            inner,
+            bytes: Box::from(value),
+        })
     }
 }
 
@@ -367,5 +437,87 @@ impl DeviceInfo {
 
     pub fn vk(&self) -> NodeVerifyingKey {
         self.vk.clone()
+    }
+}
+
+// Have to keep this as a bare vector for UniFFI.
+pub type DeviceList = Vec<Arc<DeviceInfo>>;
+
+#[uniffi::export]
+pub fn find_device_by_vk(devices: &DeviceList, vk: &NodeVerifyingKey) -> Option<Arc<DeviceInfo>> {
+    devices.iter().find(|d| d.vk == *vk).cloned()
+}
+
+// Everything a TSS node needs on a single device.
+#[derive(Clone, Serialize, Deserialize, uniffi::Object)]
+pub struct DeviceLocalData {
+    pub keyshare: Keyshare,
+    pub my_index: u8,
+    pub sk: NodeSecretKey,
+    pub devices: DeviceList,
+}
+
+#[uniffi::export]
+impl DeviceLocalData {
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
+        Self::try_from(bytes)
+    }
+
+    #[uniffi::constructor]
+    pub fn from_string(s: &str) -> Result<Self, GeneralError> {
+        Self::try_from(s)
+    }
+
+    pub fn my_index(&self) -> u8 {
+        self.my_index
+    }
+
+    // Shortcut to get the threshold value from keyshare.
+    pub fn threshold(&self) -> u8 {
+        self.keyshare.threshold()
+    }
+
+    pub fn my_device(&self) -> Arc<DeviceInfo> {
+        self.devices[self.my_index as usize].clone()
+    }
+
+    // Just a vector of arcs, so can clone the whole thing cheaply.
+    pub fn get_device_list(&self) -> DeviceList {
+        self.devices.clone()
+    }
+
+    pub fn group_vk(&self) -> NodeVerifyingKey {
+        self.keyshare.vk()
+    }
+
+    pub fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap()
+    }
+}
+
+impl DeviceLocalData {
+    pub fn my_vk(&self) -> &NodeVerifyingKey {
+        &self.devices[self.my_index as usize].vk
+    }
+}
+
+impl TryFrom<&[u8]> for DeviceLocalData {
+    type Error = GeneralError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        postcard::from_bytes(value).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+}
+
+impl TryFrom<&str> for DeviceLocalData {
+    type Error = GeneralError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        serde_json::from_str(value).map_err(|e| GeneralError::InvalidInput(e.to_string()))
     }
 }

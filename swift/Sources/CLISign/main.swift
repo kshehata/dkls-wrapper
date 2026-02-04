@@ -47,14 +47,17 @@ do {
     exit(1)
 }
 
-let keyshare: Keyshare
+let localData: DeviceLocalData
 do {
-    keyshare = try Keyshare.fromBytes(
+    localData = try DeviceLocalData.fromBytes(
         bytes: Data(contentsOf: URL(fileURLWithPath: signArgs.keyshareFilename)))
 } catch {
-    print("Error reading keyshare: \(error.localizedDescription)")
+    print("Error reading device data: \(error.localizedDescription)")
     exit(2)
 }
+
+let devices = localData.getDeviceList()
+
 print("MQTT host: \(signArgs.mqttHost)")
 print("MQTT port: \(signArgs.mqttPort)")
 print()
@@ -83,8 +86,7 @@ let netInterface = MQTTInterface(
     topic: "sign/"
 )
 
-let sk = NodeSecretKey.fromEntropy()
-let signNode = SignNode.init(secretKey: sk, keyshare: keyshare)
+let signNode = SignNode(ctx: localData)
 
 if signArgs.message.isEmpty {
     while true {
@@ -95,7 +97,20 @@ if signArgs.message.isEmpty {
             print("InstanceID: \(hexString(req.instance().toBytes()))")
             print("Message:")
             print(String(data: req.message(), encoding: .utf8)!)
-            if signArgs.skipConfirmation {
+
+            if req.partyVk().count != 1 {
+                print(colorize("ERROR: Request has \(req.partyVk().count) signatures", .red))
+                continue
+            }
+
+            let device = findDeviceByVk(devices: devices, vk: req.partyVk()[0])
+            if let d = device {
+                print("From: \(d.name())")
+            } else {
+                print(colorize("WARNING: Request from unknown device", .yellow))
+            }
+
+            if device != nil && signArgs.skipConfirmation {
                 print("Skipping confirmation")
             } else {
                 print("Approve? [y/N]")
@@ -106,7 +121,7 @@ if signArgs.message.isEmpty {
             }
             let message = req.message()
             let sig = try await signNode.doJoinRequest(req: req, netIf: netInterface)
-            verifySig(sig: sig, message: message, vk: keyshare.vk())
+            verifySig(sig: sig, message: message, vk: localData.groupVk())
             break
         } catch {
             print(colorize("Error: \(error)", .red))
@@ -117,7 +132,7 @@ if signArgs.message.isEmpty {
         print("Requesting signature for message: \(signArgs.message)")
         let message = Data(signArgs.message.utf8)
         let sig = try await signNode.doSignBytes(bytes: message, netIf: netInterface)
-        verifySig(sig: sig, message: message, vk: keyshare.vk())
+        verifySig(sig: sig, message: message, vk: localData.groupVk())
     } catch {
         print(colorize("Error: \(error)", .red))
     }

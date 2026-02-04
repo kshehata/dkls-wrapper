@@ -129,3 +129,36 @@ pub fn gen_random_keypairs(n: u8) -> (Vec<Arc<NodeSecretKey>>, Vec<NodeVerifying
         .collect();
     (sks, vks)
 }
+
+pub async fn gen_local_data_async(t: u8, n: u8) -> Vec<Arc<DeviceLocalData>> {
+    let shares = gen_keyshares_async(t as usize, n as usize).await;
+    let party_sk = (0..n)
+        .map(|_| NodeSecretKey::from_entropy())
+        .collect::<Vec<_>>();
+
+    let devices = party_sk
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| Arc::new(DeviceInfo::for_sk(format!("device_{}", i).to_string(), sk)))
+        .collect::<Vec<_>>();
+
+    party_sk
+        .into_iter()
+        .zip(shares)
+        .enumerate()
+        .map(|(i, (sk, keyshare))| {
+            Arc::new(DeviceLocalData {
+                keyshare,
+                my_index: i as u8,
+                sk,
+                devices: devices.clone(),
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+#[uniffi::export]
+pub fn gen_local_data(t: u8, n: u8) -> Vec<Arc<DeviceLocalData>> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(gen_local_data_async(t, n))
+}

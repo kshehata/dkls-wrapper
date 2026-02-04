@@ -147,6 +147,19 @@ impl DKGNode {
         self.state.read().unwrap().as_ref().unwrap().get_result()
     }
 
+    pub fn get_local_data(&self) -> Result<DeviceLocalData, GeneralError> {
+        let guard = self.state.read().unwrap();
+        let state = guard.as_ref().unwrap();
+        let keyshare = state.get_result()?;
+        let (devices, my_index) = state.get_device_list()?;
+        Ok(DeviceLocalData {
+            keyshare,
+            my_index,
+            sk: self.context.sk.clone(),
+            devices,
+        })
+    }
+
     // User pressed the "go" button.
     pub async fn start_dkg(&self) -> Result<(), GeneralError> {
         let bytes_to_send = self.do_state_fn(|state| state.start_dkg(&self.context))?;
@@ -484,8 +497,6 @@ impl<'a> PartialEq<DeviceInfo> for DeviceNetTransfer<'a> {
         self.friendly_name.as_ref() == &other.friendly_name && self.vk.as_ref() == &other.vk
     }
 }
-
-type DeviceList = Vec<Arc<DeviceInfo>>;
 
 fn verify_qr(list: &mut DeviceList, qr: &QRData) -> Result<(), GeneralError> {
     if list.len() <= qr.device_index as usize || list[qr.device_index as usize].vk != qr.vk {

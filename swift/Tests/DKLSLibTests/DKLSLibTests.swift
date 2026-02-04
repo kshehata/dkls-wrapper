@@ -79,7 +79,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
     let listener = TestSetupListener()
 
     // Run them
-    let shares = try await withThrowingTaskGroup(of: Keyshare.self) { group in
+    let shares = try await withThrowingTaskGroup(of: DeviceLocalData.self) { group in
         // Create Node 1 (Starter)
         let node1Setup = BridgeNetworkInterface(bridge: setupBridge)
         await node1Setup.connect()
@@ -101,7 +101,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         // Start Node 1 Task
         group.addTask {
             try await node1.messageLoop()
-            return try node1.getResult()
+            return try node1.getLocalData()
         }
 
         // Give Node 1 a moment to initialize
@@ -123,7 +123,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         // Start Node 2 Task
         group.addTask {
             try await node2.messageLoop()
-            return try node2.getResult()
+            return try node2.getLocalData()
         }
 
         // Give Node 2 a moment to connect and send Join
@@ -145,7 +145,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         // Start Node 3 Task
         group.addTask {
             try await node3.messageLoop()
-            return try node3.getResult()
+            return try node3.getLocalData()
         }
 
         // Wait for all 3 nodes and Node 1 Ready state
@@ -161,18 +161,75 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         // Start DKG
         try await node1.startDkg()
 
-        var results: [Keyshare] = []
-        for try await share in group {
-            results.append(share)
+        var results: [DeviceLocalData] = []
+        for try await item in group {
+            results.append(item)
         }
         return results
     }
 
     #expect(shares.count == 3)
-    let firstVk = shares[0].vk().toBytes()
+    let firstVk = shares[0].groupVk().toBytes()
     for s in shares {
-        s.print()
-        #expect(s.vk().toBytes() == firstVk)
+        // s.keyshare().print()
+        #expect(s.groupVk().toBytes() == firstVk)
+        #expect(s.getDeviceList().count == 3)
+        // Verify that we can serialize/deserialize
+        let back = try DeviceLocalData.fromBytes(bytes: s.toBytes())
+        #expect(back.groupVk().toBytes() == firstVk)
+    }
+}
+
+@Test func testSignature() async throws {
+    let data = genLocalData(t: 2, n: 3)
+    let message = "Hello World"
+
+    // Create SignNodes
+    let nodes = data.map { SignNode(ctx: $0) }
+
+    // Setup network
+    let bridge = TestMemoryBridge()
+    var interfaces: [BridgeNetworkInterface] = []
+
+    for _ in 0..<3 {
+        let net = BridgeNetworkInterface(bridge: bridge)
+        await net.connect()
+        interfaces.append(net)
+    }
+
+    // Node 0 starts a signature request
+    // We use a TaskGroup to run them all
+    try await withThrowingTaskGroup(of: Signature?.self) { group in
+        // Node 0 (Originator)
+        group.addTask {
+            return try await nodes[0].doSignString(string: message, netIf: interfaces[0])
+        }
+
+        // Node 1 (Joiner)
+        group.addTask {
+            let req = try await nodes[1].getNextReq(netIf: interfaces[1])
+            return try await nodes[1].doJoinRequest(req: req, netIf: interfaces[1])
+        }
+
+        // Node 2 (Joiner) -- Wait we only need threshold 2.
+        // But let's have everyone join or just 2?
+        // If we only run 2, the test should pass.
+
+        // Let's just run 2 nodes since T=2
+
+        // Collect results
+        var sig: Signature? = nil
+        // We expect 2 results
+        for _ in 0..<2 {
+            if let s = try await group.next() {
+                sig = s
+            }
+        }
+
+        #expect(sig != nil)
+        if let sig = sig {
+            try data[0].groupVk().verify(msg: Data(message.utf8), sig: sig)
+        }
     }
 }
 
