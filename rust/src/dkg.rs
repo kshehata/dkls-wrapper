@@ -185,6 +185,10 @@ impl DKGNode {
         while self.get_state() != DKGState::Running {
             // If message received cancelled then fall through.
             match self.process_next_setup_msg().await {
+                Err(GeneralError::InvalidSetupMessage) => {
+                    println!("Ignoring invalid setup message.");
+                    continue;
+                }
                 Err(GeneralError::Cancelled) => break,
                 res => res?,
             }
@@ -814,10 +818,7 @@ impl DKGInternalState for DKGWaitForNetState {
             .iter()
             .position(|p| p.vk.as_ref() == &context.dev.vk)
         else {
-            // TODO: pretty sure this is wrong, Gemini.
-            // We might receive a confirm message before our join message has been processed.
-            // In this case, we just ignore the message and wait for the updated one.
-            return (self, Ok(false));
+            return (self, Err(GeneralError::InvalidSetupMessage));
         };
 
         // This should be impossible: our device index matches the sender's device index.
