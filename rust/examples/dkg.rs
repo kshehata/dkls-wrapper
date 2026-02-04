@@ -1,0 +1,324 @@
+use clap::Parser;
+use dkls::dkg::{DKGNode, DKGSetupChangeListener, DKGState, DKGStateChangeListener, QRData};
+use dkls::error::GeneralError;
+use dkls::net::NetworkInterface;
+use dkls::types::{DeviceInfo, InstanceId};
+use rumqttc::v5::mqttbytes::v5::Filter;
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::{AsyncClient, MqttOptions};
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Name of this device.
+    name: String,
+
+    /// InstanceID to use in Base64 encoding. If not set, a random InstanceID will be generated.
+    #[arg(long, default_value = "")]
+    instance_id: String,
+
+    /// Threshold number of devices. Only valid for new instances.
+    #[arg(short, long, default_value_t = 2)]
+    threshold: u8,
+
+    /// Output filename.
+    #[arg(short, long, default_value = "keyshare")]
+    output_filename: String,
+
+    /// MQTT host.
+    #[arg(long, default_value = "localhost")]
+    mqtt_host: String,
+
+    /// MQTT port.
+    #[arg(long, default_value_t = 1883)]
+    mqtt_port: u16,
+
+    /// QR Data from other party.
+    #[arg(short, long, default_value = "")]
+    qr_data: String,
+}
+
+struct MQTTNetworkInterface {
+    client: AsyncClient,
+    topic: String,
+    rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl NetworkInterface for MQTTNetworkInterface {
+    async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError> {
+        self.client
+            .publish(&self.topic, QoS::AtLeastOnce, false, data)
+            .await
+            .map_err(|_e| GeneralError::MessageSendError)?;
+        Ok(())
+    }
+
+    async fn receive(&self) -> Result<Vec<u8>, GeneralError> {
+        let mut rx = self.rx.lock().await;
+        loop {
+            let data = rx.recv().await.ok_or(GeneralError::MessageSendError)?;
+            return Ok(data);
+        }
+    }
+}
+
+async fn create_mqtt_interface(
+    host: &str,
+    port: u16,
+    id_prefix: &str,
+    topic: &str,
+) -> Arc<dyn NetworkInterface> {
+    let mut mqttoptions = MqttOptions::new(
+        format!("{}-{}", id_prefix, uuid::Uuid::new_v4()),
+        host,
+        port,
+    );
+    mqttoptions.set_keep_alive(Duration::from_secs(5));
+    mqttoptions.set_max_packet_size(Some(20 * 1024 * 1024));
+
+    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    let mut filter = Filter::new(topic.to_string(), QoS::AtLeastOnce);
+    filter.nolocal = true;
+    client.subscribe_many(vec![filter]).await.unwrap();
+
+    let (tx, rx) = mpsc::channel(100);
+
+    // Spawn event loop
+    tokio::spawn(async move {
+        loop {
+            match eventloop.poll().await {
+                Ok(notification) => {
+                    use rumqttc::v5::mqttbytes::v5::Packet;
+                    if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = notification {
+                        let _ = tx.send(p.payload.to_vec()).await;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("MQTT Error: {:?}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    Arc::new(MQTTNetworkInterface {
+        client,
+        topic: topic.to_string(),
+        rx: Arc::new(Mutex::new(rx)),
+    })
+}
+
+struct SimpleSetupListener;
+impl DKGSetupChangeListener for SimpleSetupListener {
+    fn on_setup_changed(&self, parties: Vec<Arc<DeviceInfo>>, my_id: u8) {
+        println!("\n--- DKG Setup Update ---");
+        println!("Parties ({}):", parties.len());
+        for (i, party) in parties.iter().enumerate() {
+            let verified = if i == my_id as usize {
+                " (this device)"
+            } else if party.verified {
+                " (Verified)"
+            } else {
+                ""
+            };
+            let mark = if i == my_id as usize {
+                "•"
+            } else if party.verified {
+                "✓"
+            } else {
+                "?"
+            };
+            println!("  {}. {} {}{}", i + 1, mark, party.friendly_name, verified);
+        }
+        println!("------------------------\n");
+    }
+}
+
+struct SimpleStateListener {
+    dkg_node: Arc<DKGNode>,
+}
+
+impl DKGStateChangeListener for SimpleStateListener {
+    fn on_state_changed(&self, old_state: DKGState, new_state: DKGState) {
+        println!("State changed: {:?} -> {:?}", old_state, new_state);
+        // If we are waiting for parties or setup, print our QR code
+        if old_state == DKGState::WaitForSetup
+            && (new_state == DKGState::WaitForDevices
+                || new_state == DKGState::Ready
+                || new_state == DKGState::WaitForSigs)
+        {
+            if let Ok(qr) = self.dkg_node.get_qr_bytes() {
+                use base64::{engine::general_purpose, Engine as _};
+                println!("My QR: {}", general_purpose::STANDARD.encode(qr));
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let args = Args::parse();
+    let output_filename = format!("{}_{}", args.output_filename, args.name);
+
+    println!("DKLS CLI DKG Test (Rust)");
+    println!("Output filename: {}", output_filename);
+    println!("MQTT host: {}", args.mqtt_host);
+    println!("MQTT port: {}", args.mqtt_port);
+    println!();
+
+    let dkg_node: Arc<DKGNode>;
+    let setup_if: Arc<dyn NetworkInterface>;
+    let dkg_if: Arc<dyn NetworkInterface>;
+
+    if args.qr_data.is_empty() {
+        // Initiator
+        let instance_id = if args.instance_id.is_empty() {
+            InstanceId::from_entropy()
+        } else {
+            use base64::{engine::general_purpose, Engine as _};
+            let bytes = general_purpose::STANDARD
+                .decode(&args.instance_id)
+                .expect("Invalid base64 instance ID");
+            // InstanceId is [u8; 32]
+            let mut arr = [0u8; 32];
+            if bytes.len() != 32 {
+                panic!("Instance ID must be 32 bytes from base64");
+            }
+            arr.copy_from_slice(&bytes);
+            InstanceId::from(arr)
+        };
+
+        // Instance ID to hex string for topic
+        let instance_str = hex::encode(instance_id);
+
+        setup_if = create_mqtt_interface(
+            &args.mqtt_host,
+            args.mqtt_port,
+            "setup",
+            &format!("dkg/{}/setup", instance_str),
+        )
+        .await;
+
+        dkg_if = create_mqtt_interface(
+            &args.mqtt_host,
+            args.mqtt_port,
+            "proto",
+            &format!("dkg/{}/proto", instance_str),
+        )
+        .await;
+
+        println!(
+            "Starting DKG as starter for instance {}, threshold {}",
+            instance_str, args.threshold
+        );
+        dkg_node = Arc::new(DKGNode::new(
+            &args.name,
+            &instance_id,
+            args.threshold,
+            setup_if.clone(),
+            dkg_if.clone(),
+        ));
+
+        use base64::{engine::general_purpose, Engine as _};
+        println!(
+            "My QR: {}",
+            general_purpose::STANDARD.encode(dkg_node.get_qr_bytes()?)
+        );
+    } else {
+        // Participant
+        println!("Starting DKG as participant for QR data");
+        use base64::{engine::general_purpose, Engine as _};
+        let qr_bytes = general_purpose::STANDARD
+            .decode(&args.qr_data)
+            .expect("Invalid base64 QR data");
+
+        // We need to peek at the QR data to get the instance ID used for MQTT topics
+        // But `DKGNode::from_qr_bytes` consumes it or parses it.
+        // We can parse it manually using `QRData::try_from`.
+        let qr_data = QRData::try_from(qr_bytes.as_slice())?;
+        let instance_str = hex::encode(qr_data.instance);
+
+        setup_if = create_mqtt_interface(
+            &args.mqtt_host,
+            args.mqtt_port,
+            "setup",
+            &format!("dkg/{}/setup", instance_str),
+        )
+        .await;
+
+        dkg_if = create_mqtt_interface(
+            &args.mqtt_host,
+            args.mqtt_port,
+            "proto",
+            &format!("dkg/{}/proto", instance_str),
+        )
+        .await;
+
+        dkg_node = Arc::new(DKGNode::try_from_qr_bytes(
+            &args.name,
+            &qr_bytes,
+            setup_if.clone(),
+            dkg_if.clone(),
+        )?);
+    }
+
+    dkg_node.add_setup_change_listener(Box::new(SimpleSetupListener));
+    dkg_node.add_state_change_listener(Box::new(SimpleStateListener {
+        dkg_node: dkg_node.clone(),
+    }));
+
+    // Input loop for QR scanning (if initiator needs to scan others)
+    // We spawn a task for reading stdin
+    let dkg_node_clone = dkg_node.clone();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break; // EOF
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if dkg_node_clone.get_state() == DKGState::Ready {
+                    println!("Starting DKG...");
+                    if let Err(e) = dkg_node_clone.start_dkg().await {
+                        eprintln!("Error starting DKG: {:?}", e);
+                    }
+                } else {
+                    println!("Not ready yet.");
+                }
+            } else {
+                // assume QR data
+                use base64::{engine::general_purpose, Engine as _};
+                if let Ok(data) = general_purpose::STANDARD.decode(trimmed) {
+                    if let Err(e) = dkg_node_clone.receive_qr_bytes(&data) {
+                        eprintln!("Error in QR data: {:?}", e);
+                    }
+                } else {
+                    eprintln!("Invalid base64");
+                }
+            }
+        }
+    });
+
+    println!("Starting message loop...");
+    dkg_node.message_loop().await?;
+    println!("Message loop completed.");
+
+    let local_data = dkg_node.get_local_data()?;
+    let bytes = local_data.to_bytes();
+    tokio::fs::write(&output_filename, bytes).await?;
+    println!("✓ Device local data written to {}", output_filename);
+    std::process::exit(0);
+}
