@@ -3,10 +3,10 @@ use dkls::error::GeneralError;
 use dkls::net::NetworkInterface;
 use dkls::sign::SignNode;
 use dkls::types::{find_device_by_vk, DeviceLocalData, NodeVerifyingKey, Signature};
-use rumqttc::{AsyncClient, MqttOptions, QoS};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
+use rumqttc::v5::mqttbytes::v5::Filter;
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::{AsyncClient, MqttOptions};
+
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,22 +41,11 @@ struct MQTTNetworkInterface {
     client: AsyncClient,
     topic: String,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-    sent_hashes: Arc<Mutex<VecDeque<u64>>>,
 }
 
 #[async_trait::async_trait]
 impl NetworkInterface for MQTTNetworkInterface {
     async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError> {
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let hash = hasher.finish();
-        {
-            let mut sent = self.sent_hashes.lock().await;
-            sent.push_back(hash);
-            if sent.len() > 100 {
-                sent.pop_front();
-            }
-        }
         self.client
             .publish(&self.topic, QoS::AtLeastOnce, false, data)
             .await
@@ -68,17 +57,6 @@ impl NetworkInterface for MQTTNetworkInterface {
         let mut rx = self.rx.lock().await;
         loop {
             let data = rx.recv().await.ok_or(GeneralError::MessageSendError)?;
-            let mut hasher = DefaultHasher::new();
-            data.hash(&mut hasher);
-            let hash = hasher.finish();
-            {
-                let mut sent = self.sent_hashes.lock().await;
-                if let Some(pos) = sent.iter().position(|&h| h == hash) {
-                    // Check if it's our own message
-                    sent.remove(pos);
-                    continue;
-                }
-            }
             return Ok(data);
         }
     }
@@ -96,13 +74,12 @@ async fn create_mqtt_interface(
         port,
     );
     mqttoptions.set_keep_alive(Duration::from_secs(5));
-    mqttoptions.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
+    mqttoptions.set_max_packet_size(Some(20 * 1024 * 1024));
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-    client
-        .subscribe(topic, QoS::AtLeastOnce)
-        .await
-        .expect("Failed to subscribe");
+    let mut filter = Filter::new(topic.to_string(), QoS::AtLeastOnce);
+    filter.nolocal = true;
+    client.subscribe_many(vec![filter]).await.unwrap();
 
     let (tx, rx) = mpsc::channel(100);
 
@@ -111,7 +88,8 @@ async fn create_mqtt_interface(
         loop {
             match eventloop.poll().await {
                 Ok(notification) => {
-                    if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = notification {
+                    use rumqttc::v5::mqttbytes::v5::Packet;
+                    if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = notification {
                         let _ = tx.send(p.payload.to_vec()).await;
                     }
                 }
@@ -127,7 +105,6 @@ async fn create_mqtt_interface(
         client,
         topic: topic.to_string(),
         rx: Arc::new(Mutex::new(rx)),
-        sent_hashes: Arc::new(Mutex::new(VecDeque::new())),
     })
 }
 
