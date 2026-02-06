@@ -328,8 +328,9 @@ impl SignOriginatingSession {
         Ok(self.req.get_start_bytes())
     }
 
+    // Start the actually DKLS signing protocol.
+    // NB: Must hav enough parties to start or this will produce an error.
     pub async fn start_sign<R: Relay>(self, relay: R) -> Result<Signature, GeneralError> {
-        // TODO: should probably check that we're ready, but this will get absorbed into something larger anyway.
         do_sign_relay(self.ctx, self.req, 0, relay).await
     }
 

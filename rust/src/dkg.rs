@@ -407,7 +407,6 @@ impl DKGNode {
  *****************************************************************************/
 
 // QR Code data for setting up DKG.
-// TODO: hash of setup or signature ?
 #[derive(Clone, Debug, Serialize, Deserialize, uniffi::Object)]
 pub struct QRData {
     // TODO: should make all of these read-only.
