@@ -1,74 +1,70 @@
+import ArgumentParser
 import CLICore
 import DKLSLib
 import Foundation
 import MQTTNIO
 import NIO
 
-print(colorize("DKLS CLI Signing Test", .cyan))
-print()
-
-let args = ProcessInfo.processInfo.arguments
-if args.count < 2 {
-    print("Usage: \(args[0]) [keyshare filename]")
-    exit(1)
-}
-
-let keyshare: Keyshare
-do {
-    keyshare = try Keyshare.fromBytes(bytes: Data(contentsOf: URL(fileURLWithPath: args[1])))
-} catch {
-    print("Error reading keyshare: \(error.localizedDescription)")
-    exit(2)
-}
-
-let signNode: SignNode
-print(
-    colorize(
-        "Paste the setup bytes from the other party, or press enter to start a new instance:", .red)
-)
-
-// TODO: Need the message to be signed!
-// Also: the threshold, since we can't get that from Keyshare ?!?
-let threshold: UInt8 = 2
-
-let setupBase64 = readLine()!
-let instanceID: InstanceId
-if setupBase64.isEmpty {
-    print(
-        colorize(
-            "What message do you want to sign?", .red)
-    )
-    let message = readLine()!
-    instanceID = InstanceId.fromEntropy()
-    signNode = SignNode.starter(
-        message: message, instance: instanceID, threshold: threshold, keyshare: keyshare)
-
-} else {
+func verifySig(sig: Signature, message: Data, vk: NodeVerifyingKey) {
     do {
-        signNode = try SignNode.fromRequestBytes(
-            req: Data(base64Encoded: setupBase64)!, keyshare: keyshare)
+        print(colorize("✓ Signature generated", .green))
+        print()
+        print(colorize("Signature bytes: \(sig.toBytes().count) bytes", .magenta))
+        print(hexString(sig.toBytes()))
+        print()
+        try vk.verify(msg: message, sig: sig)
+        print(colorize("✓ Signature verified", .green))
     } catch {
-        print(colorize("Error parsing setup bytes", .red))
-        exit(3)
+        print(colorize("Error: \(error)", .red))
     }
 }
 
-let instanceStr = hexString(signNode.instanceId().toBytes())
-print(
-    colorize(
-        "🆔 Using Instance ID: \(instanceStr)",
-        .cyan))
-print(
-    colorize(
-        "Settings: t = \(signNode.threshold()), i = \(signNode.partyId()), hash = \(hexString(signNode.hash()))",
-        .cyan))
-print(colorize("Request bytes:", .cyan))
-print(signNode.requestBytes().base64EncodedString())
+struct SignArgs: ParsableCommand {
+    @Argument(help: "Keyshare filename.")
+    var keyshareFilename: String
+
+    @Option(name: .shortAndLong, help: "Message to sign.")
+    var message: String = ""
+
+    @Flag(name: .customShort("y"), help: "Assume yes for any confirmation prompts.")
+    var skipConfirmation = false
+
+    @Option(name: .long, help: "MQTT host.")
+    var mqttHost: String = "localhost"
+
+    @Option(name: .long, help: "MQTT port.")
+    var mqttPort: Int = 1883
+}
+
+print(colorize("DKLS CLI Signing Test", .cyan))
+print()
+
+let signArgs: SignArgs
+do {
+    signArgs = try SignArgs.parse()
+} catch {
+    print(colorize("Error parsing arguments: \(error)", .red))
+    exit(1)
+}
+
+let localData: DeviceLocalData
+do {
+    localData = try DeviceLocalData.fromBytes(
+        bytes: Data(contentsOf: URL(fileURLWithPath: signArgs.keyshareFilename)))
+} catch {
+    print("Error reading device data: \(error.localizedDescription)")
+    exit(2)
+}
+
+let devices = localData.getDeviceList()
+
+print("MQTT host: \(signArgs.mqttHost)")
+print("MQTT port: \(signArgs.mqttPort)")
 print()
 
 let client = MQTTClient(
-    host: ProcessInfo.processInfo.environment["MQTT_HOST"] ?? "localhost",
-    port: Int(ProcessInfo.processInfo.environment["MQTT_PORT"] ?? "1883")!,
+    host: signArgs.mqttHost,
+    port: signArgs.mqttPort,
     identifier: "swift-\(ProcessInfo.processInfo.processIdentifier)",
     eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
     configuration: .init(version: .v5_0)
@@ -85,54 +81,61 @@ do {
 }
 
 print(colorize("👂 Listening for messages...", .yellow))
-let reqInterface = MQTTInterface(
+let netInterface = MQTTInterface(
     client: client,
-    topic: "sign_req/\(instanceStr)"
+    topic: "sign/"
 )
 
-let service = MQTTInterface(
-    client: client,
-    topic: "sign/\(instanceStr)"
-)
+let signNode = SignNode(ctx: localData)
 
-print(colorize("✓ Connected to message stream", .green))
-print()
+if signArgs.message.isEmpty {
+    while true {
+        do {
+            let req = try await signNode.getNextReq(netIf: netInterface)
+            try req.checkSigs()
+            print(colorize("Received signature request:", .magenta))
+            print("InstanceID: \(hexString(req.instance().toBytes()))")
+            print("Message:")
+            print(String(data: req.message(), encoding: .utf8)!)
 
-do {
-    try await reqInterface.send(data: signNode.requestBytes())
-    print(colorize("✓ Sent request string", .green))
-} catch {
-    print(colorize("Error sending request string: \(error)", .red))
-    exit(1)
-}
+            if req.partyVk().count != 1 {
+                print(colorize("ERROR: Request has \(req.partyVk().count) signatures", .red))
+                continue
+            }
 
-while signNode.numParties() < signNode.threshold() {
-    do {
-        print(colorize("Waiting for other party's request string...", .yellow))
-        let data = try await reqInterface.receive()
-        print(colorize("Received Request String: \(data.count) bytes", .magenta))
-        try signNode.updateFromBytes(req: data)
-    } catch {
-        print(colorize("Error receiving messages: \(error)", .red))
-        exit(1)
+            let device = findDeviceByVk(devices: devices, vk: req.partyVk()[0])
+            if let d = device {
+                print("From: \(d.name())")
+            } else {
+                print(colorize("WARNING: Request from unknown device", .yellow))
+            }
+
+            if device != nil && signArgs.skipConfirmation {
+                print("Skipping confirmation")
+            } else {
+                print("Approve? [y/N]")
+                let approval = readLine()!
+                if approval.lowercased() != "y" {
+                    continue
+                }
+            }
+            let message = req.message()
+            let sig = try await signNode.doJoinRequest(req: req, netIf: netInterface)
+            verifySig(sig: sig, message: message, vk: localData.groupVk())
+            break
+        } catch {
+            print(colorize("Error: \(error)", .red))
+        }
     }
-}
-
-print(colorize("✓ All parties have joined", .green))
-print()
-
-do {
-    print(colorize("Generating signature...", .yellow))
-    let sig = try await signNode.doSign(interface: service)
-    print(colorize("✓ Signature generated", .green))
-    print()
-    print(colorize("Signature bytes: \(sig.toBytes().count) bytes", .magenta))
-    print(hexString(sig.toBytes()))
-    print()
-    try keyshare.vk().verify(msg: signNode.message(), sig: sig)
-    print(colorize("✓ Signature verified", .green))
-} catch {
-    print(colorize("Error: \(error)", .red))
+} else {
+    do {
+        print("Requesting signature for message: \(signArgs.message)")
+        let message = Data(signArgs.message.utf8)
+        let sig = try await signNode.doSignBytes(bytes: message, netIf: netInterface)
+        verifySig(sig: sig, message: message, vk: localData.groupVk())
+    } catch {
+        print(colorize("Error: \(error)", .red))
+    }
 }
 
 print(colorize("Disconnecting...", .yellow))

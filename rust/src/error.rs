@@ -1,11 +1,13 @@
-use uniffi::Error;
 use sl_dkls23::keygen::KeygenError as DklsKeygenError;
 use sl_dkls23::sign::SignError as DklsSignError;
+use uniffi::Error;
 
-#[derive(Debug, Error, thiserror::Error)]
+#[derive(Debug, Clone, Error, thiserror::Error)]
 pub enum GeneralError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
     #[error("Invalid signature: {0}")]
     SignatureError(String),
     #[error("Invalid setup message")]
@@ -24,6 +26,8 @@ pub enum GeneralError {
     InvalidContext,
     #[error("Internal failure")]
     Generic,
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 impl From<DklsKeygenError> for GeneralError {

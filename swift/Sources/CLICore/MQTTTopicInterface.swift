@@ -6,11 +6,13 @@ import NIO
 public class MQTTInterface: NetworkInterface {
     private let client: MQTTClient
     private let topic: String
+    private let retainOnSend: Bool
     private var messageIterator: AsyncThrowingStream<Data, Error>.Iterator?
 
-    public init(client: MQTTClient, topic: String) {
+    public init(client: MQTTClient, topic: String, retainOnSend: Bool = false) {
         self.client = client
         self.topic = topic
+        self.retainOnSend = retainOnSend
         self.messageIterator = createMessageStream().makeAsyncIterator()
     }
 
@@ -57,7 +59,8 @@ public class MQTTInterface: NetworkInterface {
         try await client.publish(
             to: topic,
             payload: ByteBuffer(data: data),
-            qos: .atLeastOnce
+            qos: .atLeastOnce,
+            retain: retainOnSend,
         ).get()
     }
 
