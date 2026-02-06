@@ -1,18 +1,13 @@
 use clap::Parser;
-use dkls::error::GeneralError;
-use dkls::net::NetworkInterface;
 use dkls::sign::SignNode;
 use dkls::types::{find_device_by_vk, DeviceLocalData, NodeVerifyingKey, Signature};
-use rumqttc::v5::mqttbytes::v5::Filter;
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, MqttOptions};
 
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
 
-use tokio::sync::Mutex;
+#[path = "common/mod.rs"]
+mod common;
+use common::mqtt::MQTTClientWrapper;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -35,77 +30,6 @@ struct Args {
     /// MQTT port.
     #[arg(long, default_value_t = 1883)]
     mqtt_port: u16,
-}
-
-struct MQTTNetworkInterface {
-    client: AsyncClient,
-    topic: String,
-    rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-}
-
-#[async_trait::async_trait]
-impl NetworkInterface for MQTTNetworkInterface {
-    async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError> {
-        self.client
-            .publish(&self.topic, QoS::AtLeastOnce, false, data)
-            .await
-            .map_err(|_e| GeneralError::MessageSendError)?;
-        Ok(())
-    }
-
-    async fn receive(&self) -> Result<Vec<u8>, GeneralError> {
-        let mut rx = self.rx.lock().await;
-        loop {
-            let data = rx.recv().await.ok_or(GeneralError::MessageSendError)?;
-            return Ok(data);
-        }
-    }
-}
-
-async fn create_mqtt_interface(
-    host: &str,
-    port: u16,
-    id_prefix: &str,
-    topic: &str,
-) -> Arc<dyn NetworkInterface> {
-    let mut mqttoptions = MqttOptions::new(
-        format!("{}-{}", id_prefix, uuid::Uuid::new_v4()),
-        host,
-        port,
-    );
-    mqttoptions.set_keep_alive(Duration::from_secs(5));
-    mqttoptions.set_max_packet_size(Some(20 * 1024 * 1024));
-
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-    let mut filter = Filter::new(topic.to_string(), QoS::AtLeastOnce);
-    filter.nolocal = true;
-    client.subscribe_many(vec![filter]).await.unwrap();
-
-    let (tx, rx) = mpsc::channel(100);
-
-    // Spawn event loop
-    tokio::spawn(async move {
-        loop {
-            match eventloop.poll().await {
-                Ok(notification) => {
-                    use rumqttc::v5::mqttbytes::v5::Packet;
-                    if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = notification {
-                        let _ = tx.send(p.payload.to_vec()).await;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("MQTT Error: {:?}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
-
-    Arc::new(MQTTNetworkInterface {
-        client,
-        topic: topic.to_string(),
-        rx: Arc::new(Mutex::new(rx)),
-    })
 }
 
 fn verify_sig(sig: &Signature, message: &[u8], vk: &NodeVerifyingKey) {
@@ -146,8 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("MQTT port: {}", args.mqtt_port);
     println!();
 
-    let net_interface =
-        create_mqtt_interface(&args.mqtt_host, args.mqtt_port, "sign", "sign/").await;
+    let mut mqtt_client = MQTTClientWrapper::new(&args.mqtt_host, args.mqtt_port, "sign");
+    let net_interface = mqtt_client.subscribe("sign/").await;
+    tokio::spawn(async move {
+        mqtt_client.event_loop().await;
+    });
 
     println!("👂 Listening for messages...");
 

@@ -1,16 +1,13 @@
 use clap::Parser;
 use dkls::dkg::{DKGNode, DKGSetupChangeListener, DKGState, DKGStateChangeListener, QRData};
-use dkls::error::GeneralError;
 use dkls::net::NetworkInterface;
 use dkls::types::{DeviceInfo, InstanceId};
-use rumqttc::v5::mqttbytes::v5::Filter;
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, MqttOptions};
 
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+
+#[path = "common/mod.rs"]
+mod common;
+use common::mqtt::MQTTClientWrapper;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,77 +38,6 @@ struct Args {
     /// QR Data from other party.
     #[arg(short, long, default_value = "")]
     qr_data: String,
-}
-
-struct MQTTNetworkInterface {
-    client: AsyncClient,
-    topic: String,
-    rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-}
-
-#[async_trait::async_trait]
-impl NetworkInterface for MQTTNetworkInterface {
-    async fn send(&self, data: Vec<u8>) -> Result<(), GeneralError> {
-        self.client
-            .publish(&self.topic, QoS::AtLeastOnce, false, data)
-            .await
-            .map_err(|_e| GeneralError::MessageSendError)?;
-        Ok(())
-    }
-
-    async fn receive(&self) -> Result<Vec<u8>, GeneralError> {
-        let mut rx = self.rx.lock().await;
-        loop {
-            let data = rx.recv().await.ok_or(GeneralError::MessageSendError)?;
-            return Ok(data);
-        }
-    }
-}
-
-async fn create_mqtt_interface(
-    host: &str,
-    port: u16,
-    id_prefix: &str,
-    topic: &str,
-) -> Arc<dyn NetworkInterface> {
-    let mut mqttoptions = MqttOptions::new(
-        format!("{}-{}", id_prefix, uuid::Uuid::new_v4()),
-        host,
-        port,
-    );
-    mqttoptions.set_keep_alive(Duration::from_secs(5));
-    mqttoptions.set_max_packet_size(Some(20 * 1024 * 1024));
-
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-    let mut filter = Filter::new(topic.to_string(), QoS::AtLeastOnce);
-    filter.nolocal = true;
-    client.subscribe_many(vec![filter]).await.unwrap();
-
-    let (tx, rx) = mpsc::channel(100);
-
-    // Spawn event loop
-    tokio::spawn(async move {
-        loop {
-            match eventloop.poll().await {
-                Ok(notification) => {
-                    use rumqttc::v5::mqttbytes::v5::Packet;
-                    if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = notification {
-                        let _ = tx.send(p.payload.to_vec()).await;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("MQTT Error: {:?}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
-
-    Arc::new(MQTTNetworkInterface {
-        client,
-        topic: topic.to_string(),
-        rx: Arc::new(Mutex::new(rx)),
-    })
 }
 
 struct SimpleSetupListener;
@@ -161,6 +87,24 @@ impl DKGStateChangeListener for SimpleStateListener {
     }
 }
 
+async fn make_net_if(
+    host: &str,
+    port: u16,
+    instance_str: &str,
+) -> (Arc<dyn NetworkInterface>, Arc<dyn NetworkInterface>) {
+    let mut mqtt_client = MQTTClientWrapper::new(host, port, "dkg");
+    let setup_if = mqtt_client
+        .subscribe(&format!("dkg/{}/setup", instance_str))
+        .await;
+    let dkg_if = mqtt_client
+        .subscribe(&format!("dkg/{}/proto", instance_str))
+        .await;
+    tokio::spawn(async move {
+        mqtt_client.event_loop().await;
+    });
+    (setup_if, dkg_if)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -174,8 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let dkg_node: Arc<DKGNode>;
-    let setup_if: Arc<dyn NetworkInterface>;
-    let dkg_if: Arc<dyn NetworkInterface>;
 
     if args.qr_data.is_empty() {
         // Initiator
@@ -198,21 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Instance ID to hex string for topic
         let instance_str = hex::encode(instance_id);
 
-        setup_if = create_mqtt_interface(
-            &args.mqtt_host,
-            args.mqtt_port,
-            "setup",
-            &format!("dkg/{}/setup", instance_str),
-        )
-        .await;
-
-        dkg_if = create_mqtt_interface(
-            &args.mqtt_host,
-            args.mqtt_port,
-            "proto",
-            &format!("dkg/{}/proto", instance_str),
-        )
-        .await;
+        let (setup_if, dkg_if) = make_net_if(&args.mqtt_host, args.mqtt_port, &instance_str).await;
 
         println!(
             "Starting DKG as starter for instance {}, threshold {}",
@@ -245,21 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
         let instance_str = hex::encode(qr_data.instance);
 
-        setup_if = create_mqtt_interface(
-            &args.mqtt_host,
-            args.mqtt_port,
-            "setup",
-            &format!("dkg/{}/setup", instance_str),
-        )
-        .await;
-
-        dkg_if = create_mqtt_interface(
-            &args.mqtt_host,
-            args.mqtt_port,
-            "proto",
-            &format!("dkg/{}/proto", instance_str),
-        )
-        .await;
+        let (setup_if, dkg_if) = make_net_if(&args.mqtt_host, args.mqtt_port, &instance_str).await;
 
         dkg_node = Arc::new(DKGNode::try_from_qr_bytes(
             &args.name,
