@@ -98,7 +98,7 @@ impl SignRequest {
         postcard::to_allocvec(self).unwrap()
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
 

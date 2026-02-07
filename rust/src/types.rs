@@ -491,7 +491,7 @@ impl DeviceLocalData {
         self.keyshare.vk()
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
 
