@@ -279,6 +279,12 @@ pub struct NodeVerifyingKey {
     bytes: Box<[u8]>,
 }
 
+impl std::hash::Hash for NodeVerifyingKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
+
 impl From<VerifyingKey> for NodeVerifyingKey {
     fn from(inner: VerifyingKey) -> Self {
         Self {
@@ -398,7 +404,9 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for ArcVerifier<T> {
  *****************************************************************************/
 
 // A device is just a friendly name and a key.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, uniffi::Object)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, uniffi::Object,
+)]
 pub struct DeviceInfo {
     pub friendly_name: String,
     pub vk: NodeVerifyingKey,
@@ -427,6 +435,24 @@ impl DeviceInfo {
 
 #[uniffi::export]
 impl DeviceInfo {
+    // For UniFFI clients to be able to construct from an Arc.
+    #[uniffi::constructor]
+    pub fn init(friendly_name: String, vk: Arc<NodeVerifyingKey>) -> Self {
+        Self {
+            friendly_name,
+            vk: Arc::unwrap_or_clone(vk),
+            verified: false,
+        }
+    }
+
+    #[uniffi::constructor]
+    pub fn dummy(friendly_name: String, verified: bool) -> Self {
+        let sk = NodeSecretKey::from_entropy();
+        let mut info = Self::for_sk(friendly_name, &sk);
+        info.verified = verified;
+        info
+    }
+
     pub fn name(&self) -> String {
         self.friendly_name.clone()
     }

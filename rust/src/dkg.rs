@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use rand::{Rng, SeedableRng};
@@ -407,7 +408,7 @@ impl DKGNode {
  *****************************************************************************/
 
 // QR Code data for setting up DKG.
-#[derive(Clone, Debug, Serialize, Deserialize, uniffi::Object)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, uniffi::Object)]
 pub struct QRData {
     // TODO: should make all of these read-only.
     pub instance: InstanceId,
@@ -435,6 +436,22 @@ impl TryFrom<&str> for QRData {
 
 #[uniffi::export]
 impl QRData {
+    // Needed for Swift to make mocks. Shouldn't be used otherwise.
+    #[uniffi::constructor]
+    pub fn new(
+        instance: &InstanceId,
+        threshold: u8,
+        device_index: u8,
+        vk: &NodeVerifyingKey,
+    ) -> Self {
+        Self {
+            instance: instance.clone(),
+            threshold,
+            device_index,
+            vk: vk.clone(),
+        }
+    }
+
     #[uniffi::constructor]
     pub fn from_bytes(bytes: &[u8]) -> Result<Arc<QRData>, GeneralError> {
         Ok(Arc::new(Self::try_from(bytes)?))
@@ -443,6 +460,18 @@ impl QRData {
     #[uniffi::constructor]
     pub fn from_string(s: &str) -> Result<Arc<QRData>, GeneralError> {
         Ok(Arc::new(Self::try_from(s)?))
+    }
+
+    // needed in Swift
+    pub fn equals(&self, other: &QRData) -> bool {
+        self == other
+    }
+
+    // needed in Swift
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
