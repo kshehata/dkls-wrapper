@@ -33,6 +33,10 @@ let package = Package(
             url: "https://github.com/apple/swift-argument-parser.git",
             from: "1.3.0"
         ),
+        .package(
+            url: "https://github.com/ehn-dcc-development/base45-swift.git",
+            from: "1.1.0"
+        ),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -55,6 +59,7 @@ let package = Package(
                 "DKLSLib",
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "base45-swift", package: "base45-swift"),
             ]
         ),
         .executableTarget(

@@ -4,6 +4,7 @@ import DKLSLib
 import Foundation
 import MQTTNIO
 import NIO
+import base45_swift
 
 struct DKGArgs: ParsableCommand {
     @Argument(help: "Name of this device.")
@@ -11,7 +12,7 @@ struct DKGArgs: ParsableCommand {
 
     @Option(
         help:
-            "InstanceID to use in Base64 encoding. If not set, a random InstanceID will be generated."
+            "InstanceID to use in Base45 encoding. If not set, a random InstanceID will be generated."
     )
     var instanceID: String = ""
 
@@ -36,11 +37,8 @@ struct DKGArgs: ParsableCommand {
         }
         if qrData.isEmpty {
             if !instanceID.isEmpty {
-                guard let data = Data(base64Encoded: instanceID) else {
-                    throw ValidationError("Instance ID must be valid base64")
-                }
                 do {
-                    _ = try InstanceId.fromBytes(bytes: data)
+                    _ = try self.decodeInstanceID()
                 } catch {
                     throw ValidationError("Invalid Instance ID")
                 }
@@ -49,14 +47,26 @@ struct DKGArgs: ParsableCommand {
                 throw ValidationError("Threshold must be at least 2")
             }
         } else {
-            guard Data(base64Encoded: qrData) != nil else {
-                throw ValidationError("QR Data must be valid base64")
+            do {
+                _ = try self.decodeQrBytes()
+            } catch {
+                throw ValidationError("QR Data must be valid Base45")
             }
             if !instanceID.isEmpty {
                 throw ValidationError("Cannot set InstanceID when using QR Data.")
             }
         }
     }
+
+    func decodeInstanceID() throws -> InstanceId {
+        let bytes = try instanceID.fromBase45()
+        return try InstanceId.fromBytes(bytes: bytes)
+    }
+
+    func decodeQrBytes() throws -> Data {
+        return try qrData.fromBase45()
+    }
+
 }
 
 print(colorize("DKLS CLI DKG Test", .cyan))
@@ -108,7 +118,8 @@ if dkgArgs.qrData.isEmpty {
         instanceID = InstanceId.fromEntropy()
     } else {
         do {
-            instanceID = try InstanceId.fromBytes(bytes: Data(base64Encoded: dkgArgs.instanceID)!)
+            let bytes = try dkgArgs.instanceID.fromBase45()
+            instanceID = try InstanceId.fromBytes(bytes: bytes)
         } catch {
             print(colorize("This should never happen: Invalid Instance ID", .red))
             exit(1)
@@ -128,7 +139,7 @@ if dkgArgs.qrData.isEmpty {
         setupIf: setupInterface, dkgIf: dkgInterface)
 
     do {
-        try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))
+        try print(colorize("My QR: |\(dkgNode.getQrBytes().toBase45())|", .yellow))
     } catch {
         // Should never happen at this point.
         print(colorize("Error getting QR data: \(error)", .red))
@@ -138,7 +149,7 @@ if dkgArgs.qrData.isEmpty {
 } else {
     print(colorize("Starting DKG as participant for QR data \(dkgArgs.qrData)", .yellow))
     do {
-        let qr = try QrData.fromBytes(bytes: Data(base64Encoded: dkgArgs.qrData)!)
+        let qr = try QrData.fromBytes(bytes: try dkgArgs.decodeQrBytes())
         let instanceStr = hexString(qr.getInstance().toBytes())
         let setupInterface = getMQTTInterface(instanceStr, "setup")
         let dkgInterface = getMQTTInterface(instanceStr, "proto")
@@ -198,7 +209,7 @@ final class StateChangeListener: DkgStateChangeListener, @unchecked Sendable {
             && (newState == .waitForSigs || newState == .waitForDevices || newState == .ready)
         {
             do {
-                try print(colorize("My QR: \(dkgNode.getQrBytes().base64EncodedString())", .yellow))
+                try print(colorize("My QR: |\(dkgNode.getQrBytes().toBase45())|", .yellow))
             } catch {
                 // Should never happen at this point.
                 print(colorize("Error getting QR data: \(error)", .red))
@@ -224,8 +235,8 @@ var inputTask = Task.detached {
             }
         } else {
             // Assume this is QR data
-            guard let qrData = Data(base64Encoded: line) else {
-                print(colorize("QR Data has invalid Base 64 encoding", .red))
+            guard let qrData = try? line.fromBase45() else {
+                print(colorize("QR Data has invalid Base45 encoding", .red))
                 continue
             }
             do {
