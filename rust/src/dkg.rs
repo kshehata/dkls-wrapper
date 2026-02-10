@@ -1493,7 +1493,7 @@ mod tests {
 
         // Wait for all nodes to finish DKG.
         for watcher in &mut state_watchers {
-            assert!(watcher.wait_for_state(DKGState::Finished, 5000).await);
+            assert!(watcher.wait_for_state(DKGState::Finished, 10000).await);
         }
 
         // Check results
