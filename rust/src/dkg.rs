@@ -471,6 +471,10 @@ impl QRData {
         self.instance
     }
 
+    pub fn get_threshold(&self) -> u8 {
+        self.threshold
+    }
+
     pub fn get_device_index(&self) -> u8 {
         self.device_index
     }
