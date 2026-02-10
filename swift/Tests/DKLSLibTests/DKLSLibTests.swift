@@ -89,9 +89,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         let node1 = DkgNode(
             name: "Node 1",
             instance: instance,
-            threshold: 2,
-            setupIf: node1Setup,
-            dkgIf: node1Dkg
+            threshold: 2
         )
         node1.addSetupChangeListener(listener: listener)
 
@@ -100,7 +98,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
 
         // Start Node 1 Task
         group.addTask {
-            try await node1.messageLoop()
+            try await node1.messageLoop(setupIf: node1Setup, dkgIf: node1Dkg)
             return try node1.getLocalData()
         }
 
@@ -115,14 +113,12 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
 
         let node2 = DkgNode.fromQr(
             name: "Node 2",
-            qrData: qr,
-            setupIf: node2Setup,
-            dkgIf: node2Dkg
+            qrData: qr
         )
 
         // Start Node 2 Task
         group.addTask {
-            try await node2.messageLoop()
+            try await node2.messageLoop(setupIf: node2Setup, dkgIf: node2Dkg)
             return try node2.getLocalData()
         }
 
@@ -137,14 +133,12 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
 
         let node3 = DkgNode.fromQr(
             name: "Node 3",
-            qrData: qr,
-            setupIf: node3Setup,
-            dkgIf: node3Dkg
+            qrData: qr
         )
 
         // Start Node 3 Task
         group.addTask {
-            try await node3.messageLoop()
+            try await node3.messageLoop(setupIf: node3Setup, dkgIf: node3Dkg)
             return try node3.getLocalData()
         }
 

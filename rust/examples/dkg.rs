@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dkg_node: Arc<DKGNode>;
 
-    if args.qr_data.is_empty() {
+    let instance_str = if args.qr_data.is_empty() {
         // Initiator
         let instance_id = if args.instance_id.is_empty() {
             InstanceId::from_entropy()
@@ -140,25 +140,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Instance ID to hex string for topic
         let instance_str = hex::encode(instance_id);
 
-        let (setup_if, dkg_if) = make_net_if(&args.mqtt_host, args.mqtt_port, &instance_str).await;
-
         println!(
             "Starting DKG as starter for instance {}, threshold {}",
             instance_str, args.threshold
         );
-        dkg_node = Arc::new(DKGNode::new(
-            &args.name,
-            &instance_id,
-            args.threshold,
-            setup_if.clone(),
-            dkg_if.clone(),
-        ));
+        dkg_node = Arc::new(DKGNode::new(&args.name, &instance_id, args.threshold));
 
         use base64::{engine::general_purpose, Engine as _};
         println!(
             "My QR: {}",
             general_purpose::STANDARD.encode(dkg_node.get_qr_bytes()?)
         );
+        instance_str
     } else {
         // Participant
         println!("Starting DKG as participant for QR data");
@@ -171,17 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // But `DKGNode::from_qr_bytes` consumes it or parses it.
         // We can parse it manually using `QRData::try_from`.
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
-        let instance_str = hex::encode(qr_data.instance);
 
-        let (setup_if, dkg_if) = make_net_if(&args.mqtt_host, args.mqtt_port, &instance_str).await;
-
-        dkg_node = Arc::new(DKGNode::try_from_qr_bytes(
-            &args.name,
-            &qr_bytes,
-            setup_if.clone(),
-            dkg_if.clone(),
-        )?);
-    }
+        dkg_node = Arc::new(DKGNode::try_from_qr_bytes(&args.name, &qr_bytes)?);
+        hex::encode(qr_data.instance)
+    };
 
     dkg_node.add_setup_change_listener(Box::new(SimpleSetupListener));
     dkg_node.add_state_change_listener(Box::new(SimpleStateListener {
@@ -226,8 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let (setup_if, dkg_if) = make_net_if(&args.mqtt_host, args.mqtt_port, &instance_str).await;
     println!("Starting message loop...");
-    dkg_node.message_loop().await?;
+    dkg_node.message_loop(setup_if, dkg_if).await?;
     println!("Message loop completed.");
 
     let local_data = dkg_node.get_local_data()?;

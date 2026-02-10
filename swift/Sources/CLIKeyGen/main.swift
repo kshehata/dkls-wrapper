@@ -86,32 +86,8 @@ print("MQTT host: \(dkgArgs.mqttHost)")
 print("MQTT port: \(dkgArgs.mqttPort)")
 print()
 
-let client = MQTTClient(
-    host: dkgArgs.mqttHost,
-    port: dkgArgs.mqttPort,
-    identifier: "swift-\(ProcessInfo.processInfo.processIdentifier)",
-    eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
-    configuration: .init(version: .v5_0)
-)
-
-print(colorize("Connecting to MQTT broker...", .yellow))
-do {
-    _ = try await client.connect().get()
-    print(colorize("Connected!", .green))
-
-} catch {
-    print(colorize("Error: \(error)", .red))
-    exit(1)
-}
-
-func getMQTTInterface(_ instanceStr: String, _ sub: String) -> MQTTInterface {
-    return MQTTInterface(
-        client: client,
-        topic: "dkg/\(instanceStr)/\(sub)",
-    )
-}
-
 let dkgNode: DkgNode
+let instanceStr: String
 if dkgArgs.qrData.isEmpty {
     let instanceID: InstanceId
     if dkgArgs.instanceID.isEmpty {
@@ -125,18 +101,15 @@ if dkgArgs.qrData.isEmpty {
             exit(1)
         }
     }
+    instanceStr = hexString(instanceID.toBytes())
     print(colorize("👂 Listening for messages...", .yellow))
-    let instanceStr = hexString(instanceID.toBytes())
-    let setupInterface = getMQTTInterface(instanceStr, "setup")
-    let dkgInterface = getMQTTInterface(instanceStr, "proto")
     print(
         colorize(
             "Starting DKG as starter for instance \(instanceStr), threshold \(dkgArgs.threshold)",
             .yellow
         ))
     dkgNode = DkgNode.init(
-        name: dkgArgs.name, instance: instanceID, threshold: dkgArgs.threshold,
-        setupIf: setupInterface, dkgIf: dkgInterface)
+        name: dkgArgs.name, instance: instanceID, threshold: dkgArgs.threshold)
 
     do {
         try print(colorize("My QR: |\(dkgNode.getQrBytes().toBase45())|", .yellow))
@@ -150,23 +123,44 @@ if dkgArgs.qrData.isEmpty {
     print(colorize("Starting DKG as participant for QR data \(dkgArgs.qrData)", .yellow))
     do {
         let qr = try QrData.fromBytes(bytes: try dkgArgs.decodeQrBytes())
-        let instanceStr = hexString(qr.getInstance().toBytes())
-        let setupInterface = getMQTTInterface(instanceStr, "setup")
-        let dkgInterface = getMQTTInterface(instanceStr, "proto")
-        dkgNode = DkgNode.fromQr(
-            name: dkgArgs.name, qrData: qr,
-            setupIf: setupInterface,
-            dkgIf: dkgInterface)
+        instanceStr = hexString(qr.getInstance().toBytes())
+        dkgNode = DkgNode.fromQr(name: dkgArgs.name, qrData: qr)
     } catch {
         print(colorize("Error parsing QR data: \(error)", .red))
         exit(1)
     }
 }
 
+let client = MQTTClient(
+    host: dkgArgs.mqttHost,
+    port: dkgArgs.mqttPort,
+    identifier: "swift-\(ProcessInfo.processInfo.processIdentifier)",
+    eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
+    configuration: .init(version: .v5_0)
+)
+
 var messageLoopTask = Task {
+    print(colorize("Connecting to MQTT broker...", .yellow))
+    do {
+        _ = try await client.connect().get()
+        print(colorize("Connected!", .green))
+
+    } catch {
+        print(colorize("Error: \(error)", .red))
+        exit(1)
+    }
+    let setupInterface = MQTTInterface(
+        client: client,
+        topic: "dkg/\(instanceStr)/setup",
+    )
+    let dkgInterface = MQTTInterface(
+        client: client,
+        topic: "dkg/\(instanceStr)/proto",
+    )
+
     do {
         print(colorize("Starting message loop...", .yellow))
-        try await dkgNode.messageLoop()
+        try await dkgNode.messageLoop(setupIf: setupInterface, dkgIf: dkgInterface)
     } catch {
         print(colorize("Error in message loop: \(error)", .red))
     }

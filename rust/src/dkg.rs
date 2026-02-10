@@ -29,8 +29,6 @@ pub struct DKGNode {
     listeners: RwLock<Vec<Box<dyn DKGStateChangeListener>>>,
     setup_listeners: RwLock<Vec<Box<dyn DKGSetupChangeListener>>>,
     context: DKGContext,
-    setup_if: Arc<dyn NetworkInterface>,
-    dkg_if: Arc<dyn NetworkInterface>,
     await_msg_kick: Notify,
 }
 
@@ -47,13 +45,7 @@ pub trait DKGStateChangeListener: Send + Sync {
 #[uniffi::export]
 impl DKGNode {
     #[uniffi::constructor]
-    pub fn new(
-        name: &str,
-        instance: &InstanceId,
-        threshold: u8,
-        setup_if: Arc<dyn NetworkInterface>,
-        dkg_if: Arc<dyn NetworkInterface>,
-    ) -> Self {
+    pub fn new(name: &str, instance: &InstanceId, threshold: u8) -> Self {
         let context = DKGContext::new(
             instance.clone(),
             threshold,
@@ -66,19 +58,12 @@ impl DKGNode {
             listeners: RwLock::new(Vec::new()),
             setup_listeners: RwLock::new(Vec::new()),
             context,
-            setup_if,
-            dkg_if,
             await_msg_kick: Notify::new(),
         }
     }
 
     #[uniffi::constructor]
-    pub fn from_qr(
-        name: &str,
-        qr_data: Arc<QRData>,
-        setup_if: Arc<dyn NetworkInterface>,
-        dkg_if: Arc<dyn NetworkInterface>,
-    ) -> Self {
+    pub fn from_qr(name: &str, qr_data: Arc<QRData>) -> Self {
         let context = DKGContext::new(
             qr_data.instance.clone(),
             qr_data.threshold,
@@ -90,21 +75,14 @@ impl DKGNode {
             listeners: RwLock::new(Vec::new()),
             setup_listeners: RwLock::new(Vec::new()),
             context,
-            setup_if,
-            dkg_if,
             await_msg_kick: Notify::new(),
         }
     }
 
     #[uniffi::constructor]
-    pub fn try_from_qr_bytes(
-        name: &str,
-        qr_bytes: &Vec<u8>,
-        setup_if: Arc<dyn NetworkInterface>,
-        dkg_if: Arc<dyn NetworkInterface>,
-    ) -> Result<Self, GeneralError> {
+    pub fn try_from_qr_bytes(name: &str, qr_bytes: &Vec<u8>) -> Result<Self, GeneralError> {
         let qr_data = QRData::try_from(qr_bytes.as_slice())?;
-        Ok(Self::from_qr(name, Arc::new(qr_data), setup_if, dkg_if))
+        Ok(Self::from_qr(name, Arc::new(qr_data)))
     }
 
     pub fn get_name(&self) -> String {
@@ -163,28 +141,21 @@ impl DKGNode {
 
     // User pressed the "go" button.
     pub async fn start_dkg(&self) -> Result<(), GeneralError> {
-        let bytes_to_send = self.do_state_fn(|state| state.start_dkg(&self.context))?;
-        if !bytes_to_send.is_empty() {
-            self.setup_if.send(bytes_to_send).await?;
-        }
+        self.do_state_fn(|state| state.start_dkg(&self.context))?;
+        // If there are bytes to send, they will be sent by the message loop.
         self.await_msg_kick.notify_waiters();
         Ok(())
     }
 
     // Call this on the thread to receive messages.
     // Recall to retry after errors.
-    pub async fn message_loop(&self) -> Result<(), GeneralError> {
-        // HACK: Need to send the initial setup message if we're the first one.
-
-        // println!(
-        //     "{:?} Message loop start in state {:?}",
-        //     self.context.friendly_name,
-        //     self.get_state()
-        // );
-        if self.get_state() == DKGState::WaitForDevices
-            || self.get_state() == DKGState::WaitForSetup
-        {
-            // println!("{:?} Sending setup message", self.context.friendly_name);
+    pub async fn message_loop(
+        &self,
+        setup_if: Arc<dyn NetworkInterface>,
+        dkg_if: Arc<dyn NetworkInterface>,
+    ) -> Result<(), GeneralError> {
+        // Have to send out a request message if we're waiting for setup.
+        if self.get_state() == DKGState::WaitForSetup {
             let setup_bytes = self
                 .state
                 .read()
@@ -193,18 +164,48 @@ impl DKGNode {
                 .unwrap()
                 .get_bytes_to_send(&self.context)
                 .unwrap();
-            self.setup_if.send(setup_bytes).await?;
+            setup_if.send(setup_bytes).await?;
         }
 
+        // println!(
+        //     "{:?} Message loop start in state {:?}",
+        //     self.context.friendly_name,
+        //     self.get_state()
+        // );
+
         while self.get_state() != DKGState::Running {
-            // If message received cancelled then fall through.
-            match self.process_next_setup_msg().await {
+            // println!("{:?} Waiting for setup message", self.context.friendly_name);
+            let msg = match self.get_next_msg_interruptable(setup_if.clone()).await {
+                Ok(msg) => msg,
+                Err(GeneralError::Cancelled) => {
+                    // Start DKG if we were interrupted and we are now in the running state.
+                    if self.get_state() == DKGState::Running {
+                        let setup_bytes = self
+                            .state
+                            .read()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .get_bytes_to_send(&self.context)
+                            .unwrap();
+                        setup_if.send(setup_bytes).await?;
+                        break;
+                    } else {
+                        return Err(GeneralError::Cancelled);
+                    }
+                }
                 Err(GeneralError::InvalidSetupMessage) => {
-                    println!("Ignoring invalid setup message.");
+                    // Just ignore it and keep waiting.
                     continue;
                 }
-                Err(GeneralError::Cancelled) => break,
-                res => res?,
+                Err(e) => return Err(e),
+            };
+
+            // println!("{:?} Received setup message", self.context.friendly_name);
+
+            let bytes_to_send = self.handle_setup_msg(msg)?;
+            if !bytes_to_send.is_empty() {
+                setup_if.send(bytes_to_send).await?;
             }
         }
         // Start the actual DKG
@@ -221,7 +222,7 @@ impl DKGNode {
         };
 
         // println!("{:?} Starting DKG", self.context.friendly_name);
-        let res = self.do_dkg_internal(&devices, device_index).await;
+        let res = self.do_dkg_internal(dkg_if, &devices, device_index).await;
         // println!("{:?} DKG Complete?", self.context.friendly_name);
 
         let _ =
@@ -264,8 +265,11 @@ impl DKGNode {
     }
 
     // Shortcut to receive and parse a setup message.
-    async fn get_next_msg_interruptable(&self) -> Result<SignedDKGSetupMessage<'_>, GeneralError> {
-        let receive_fut = self.setup_if.receive();
+    async fn get_next_msg_interruptable(
+        &self,
+        setup_if: Arc<dyn NetworkInterface>,
+    ) -> Result<SignedDKGSetupMessage<'_>, GeneralError> {
+        let receive_fut = setup_if.receive();
         let stop_fut = self.await_msg_kick.notified();
 
         let data = tokio::select! {
@@ -283,28 +287,13 @@ impl DKGNode {
         Ok(msg)
     }
 
-    async fn process_next_setup_msg(&self) -> Result<(), GeneralError> {
-        // println!("{:?} Waiting for setup message", self.context.friendly_name);
-        let setup_msg = self.get_next_msg_interruptable().await?;
-        // println!("{:?} Received setup message", self.context.friendly_name);
-        let bytes_to_send =
-            self.do_state_fn(|state| state.receive_setup_msg(&self.context, setup_msg))?;
-        if !bytes_to_send.is_empty() {
-            self.setup_if.send(bytes_to_send).await?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn test_handle_setup_msg(
-        &self,
-        setup_msg: SignedDKGSetupMessage,
-    ) -> Result<Vec<u8>, GeneralError> {
+    fn handle_setup_msg(&self, setup_msg: SignedDKGSetupMessage) -> Result<Vec<u8>, GeneralError> {
         self.do_state_fn(|state| state.receive_setup_msg(&self.context, setup_msg))
     }
 
     async fn do_dkg_internal(
         &self,
+        dkg_if: Arc<dyn NetworkInterface>,
         devices: &DeviceList,
         device_index: u8,
     ) -> Result<Keyshare, GeneralError> {
@@ -324,14 +313,10 @@ impl DKGNode {
         let mut rng = ChaCha20Rng::from_entropy();
 
         // println!("{:?} keygen_run", self.context.friendly_name);
-        let result = keygen_run(
-            setup_msg,
-            rng.gen(),
-            create_network_relay(self.dkg_if.clone()),
-        )
-        .await
-        .map(|k| Keyshare(Arc::new(k)))
-        .map_err(GeneralError::from);
+        let result = keygen_run(setup_msg, rng.gen(), create_network_relay(dkg_if))
+            .await
+            .map(|k| Keyshare(Arc::new(k)))
+            .map_err(GeneralError::from);
         // println!("{:?} keygen_run done", self.context.friendly_name);
 
         result
@@ -1297,9 +1282,11 @@ mod tests {
     fn spawn_node(
         js: &mut tokio::task::JoinSet<()>,
         node: Arc<DKGNode>,
+        setup_if: Arc<dyn NetworkInterface>,
+        dkg_if: Arc<dyn NetworkInterface>,
     ) -> tokio::task::AbortHandle {
         js.spawn(async move {
-            let res = node.message_loop().await;
+            let res = node.message_loop(setup_if, dkg_if).await;
             println!("Node {} finished with result: {:?}", node.get_name(), res);
         })
     }
@@ -1368,39 +1355,47 @@ mod tests {
         let setup_coord = InMemoryBridge::new();
         let dkg_coord = InMemoryBridge::new();
 
-        let mut nodes = vec![Arc::new(DKGNode::new(
-            "Node1",
-            &instance,
-            2,
-            setup_coord.connect(),
-            dkg_coord.connect(),
-        ))];
+        let mut nodes = vec![Arc::new(DKGNode::new("Node1", &instance, 2))];
 
         assert_eq!(nodes[0].get_state(), DKGState::WaitForDevices);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
         let mut devices = tokio::task::JoinSet::new();
-        spawn_node(&mut devices, nodes[0].clone());
+        spawn_node(
+            &mut devices,
+            nodes[0].clone(),
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        );
 
         let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
         assert_eq!(qr.device_index, 0);
         // TODO: check vk
 
-        nodes.push(Arc::new(DKGNode::from_qr(
-            "Node2",
-            qr.clone(),
-            setup_coord.connect(),
-            dkg_coord.connect(),
-        )));
+        nodes.push(Arc::new(DKGNode::from_qr("Node2", qr.clone())));
 
         assert_eq!(nodes[1].get_state(), DKGState::WaitForSetup);
         state_watchers.push(DKGStateReceiver::watch_node(&nodes[1]));
-        spawn_node(&mut devices, nodes[1].clone());
+        spawn_node(
+            &mut devices,
+            nodes[1].clone(),
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        );
 
         // Wait for both nodes to become ready.
-        for watcher in &mut state_watchers {
-            assert!(watcher.wait_for_state(DKGState::Ready, 2000).await);
+        for (i, watcher) in state_watchers.iter_mut().enumerate() {
+            println!(
+                "Waiting for node {} to become ready, current state: {:?}",
+                i,
+                nodes[i].get_state()
+            );
+            assert!(
+                watcher.wait_for_state(DKGState::Ready, 2000).await,
+                "Node {} did not become ready",
+                i
+            );
         }
 
         // Check verification status
@@ -1436,19 +1431,18 @@ mod tests {
         let setup_coord = InMemoryBridge::new();
         let dkg_coord = InMemoryBridge::new();
 
-        let mut nodes = vec![Arc::new(DKGNode::new(
-            "Node1",
-            &instance,
-            3,
-            setup_coord.connect(),
-            dkg_coord.connect(),
-        ))];
+        let mut nodes = vec![Arc::new(DKGNode::new("Node1", &instance, 3))];
 
         assert_eq!(nodes[0].get_state(), DKGState::WaitForDevices);
         let mut state_watchers = vec![DKGStateReceiver::watch_node(&nodes[0])];
 
         let mut devices = tokio::task::JoinSet::new();
-        spawn_node(&mut devices, nodes[0].clone());
+        spawn_node(
+            &mut devices,
+            nodes[0].clone(),
+            setup_coord.connect(),
+            dkg_coord.connect(),
+        );
 
         let qr = Arc::new(nodes[0].get_qr().unwrap());
         assert_eq!(qr.instance, instance);
@@ -1459,12 +1453,15 @@ mod tests {
             nodes.push(Arc::new(DKGNode::from_qr(
                 format!("Node{}", i + 1).as_str(),
                 qr.clone(),
-                setup_coord.connect(),
-                dkg_coord.connect(),
             )));
             assert_eq!(nodes[i].get_state(), DKGState::WaitForSetup);
             state_watchers.push(DKGStateReceiver::watch_node(&nodes[i]));
-            spawn_node(&mut devices, nodes[i].clone());
+            spawn_node(
+                &mut devices,
+                nodes[i].clone(),
+                setup_coord.connect(),
+                dkg_coord.connect(),
+            );
 
             // Wait for all nodes to become ready.
             let exp_state = if i < 2 {
@@ -1535,16 +1532,8 @@ mod tests {
             vk: devices[0].vk.clone(),
         };
 
-        let setup_if = InMemoryBridge::new();
-        let dkg_if = InMemoryBridge::new();
-
         // Node 3 is joining
-        let node3 = Arc::new(DKGNode::from_qr(
-            "Node3",
-            Arc::new(qr),
-            setup_if.connect(),
-            dkg_if.connect(),
-        ));
+        let node3 = Arc::new(DKGNode::from_qr("Node3", Arc::new(qr)));
 
         devices.push(node3.context.dev.clone());
 
@@ -1554,7 +1543,7 @@ mod tests {
             &device_sks[0],
         );
 
-        let _ = node3.test_handle_setup_msg(msg).unwrap();
+        let _ = node3.handle_setup_msg(msg).unwrap();
         assert_eq!(node3.get_state(), DKGState::WaitForSigs);
 
         Arc::make_mut(&mut devices[0]).verified = true;
