@@ -15,7 +15,7 @@ struct Args {
     /// Name of this device.
     name: String,
 
-    /// InstanceID to use in Base64 encoding. If not set, a random InstanceID will be generated.
+    /// InstanceID to use in Base45 encoding. If not set, a random InstanceID will be generated.
     #[arg(long, default_value = "")]
     instance_id: String,
 
@@ -80,8 +80,7 @@ impl DKGStateChangeListener for SimpleStateListener {
                 || new_state == DKGState::WaitForSigs)
         {
             if let Ok(qr) = self.dkg_node.get_qr_bytes() {
-                use base64::{engine::general_purpose, Engine as _};
-                println!("My QR: {}", general_purpose::STANDARD.encode(qr));
+                println!("My QR: {}", base45::encode(&qr));
             }
         }
     }
@@ -124,14 +123,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance_id = if args.instance_id.is_empty() {
             InstanceId::from_entropy()
         } else {
-            use base64::{engine::general_purpose, Engine as _};
-            let bytes = general_purpose::STANDARD
-                .decode(&args.instance_id)
-                .expect("Invalid base64 instance ID");
+            let bytes = base45::decode(&args.instance_id)
+                .map_err(|e| format!("Invalid base45 instance ID: {:?}", e))?;
             // InstanceId is [u8; 32]
             let mut arr = [0u8; 32];
             if bytes.len() != 32 {
-                panic!("Instance ID must be 32 bytes from base64");
+                panic!("Instance ID must be 32 bytes from base45");
             }
             arr.copy_from_slice(&bytes);
             InstanceId::from(arr)
@@ -146,19 +143,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         dkg_node = Arc::new(DKGNode::new(&args.name, &instance_id, args.threshold));
 
-        use base64::{engine::general_purpose, Engine as _};
-        println!(
-            "My QR: {}",
-            general_purpose::STANDARD.encode(dkg_node.get_qr_bytes()?)
-        );
+        println!("My QR: {}", base45::encode(&dkg_node.get_qr_bytes()?));
         instance_str
     } else {
         // Participant
         println!("Starting DKG as participant for QR data");
-        use base64::{engine::general_purpose, Engine as _};
-        let qr_bytes = general_purpose::STANDARD
-            .decode(&args.qr_data)
-            .expect("Invalid base64 QR data");
+        let qr_bytes = base45::decode(&args.qr_data)
+            .map_err(|e| format!("Invalid base45 QR data: {:?}", e))?;
 
         // We need to peek at the QR data to get the instance ID used for MQTT topics
         // But `DKGNode::from_qr_bytes` consumes it or parses it.
@@ -200,13 +191,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // assume QR data
-                use base64::{engine::general_purpose, Engine as _};
-                if let Ok(data) = general_purpose::STANDARD.decode(trimmed) {
+                if let Ok(data) = base45::decode(trimmed) {
                     if let Err(e) = dkg_node_clone.receive_qr_bytes(&data) {
                         eprintln!("Error in QR data: {:?}", e);
                     }
                 } else {
-                    eprintln!("Invalid base64");
+                    eprintln!("Invalid base45");
                 }
             }
         }
