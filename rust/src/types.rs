@@ -1,5 +1,6 @@
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use k256::elliptic_curve::group::GroupEncoding;
+use k256::elliptic_curve::pkcs8::EncodePublicKey;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -379,6 +380,12 @@ impl NodeVerifyingKey {
         self.hash(&mut hasher);
         hasher.finish()
     }
+
+    pub fn to_pem(&self) -> String {
+        self.inner
+            .to_public_key_pem(Default::default())
+            .expect("Failed to export vk to PEM")
+    }
 }
 
 impl TryFrom<&[u8]> for NodeVerifyingKey {
@@ -590,6 +597,10 @@ impl DeviceLocalData {
     // Just a vector of arcs, so can clone the whole thing cheaply.
     pub fn get_device_list(&self) -> DeviceList {
         self.devices.clone()
+    }
+
+    pub fn key_id(&self) -> Vec<u8> {
+        self.keyshare.key_id()
     }
 
     pub fn group_vk(&self) -> NodeVerifyingKey {
