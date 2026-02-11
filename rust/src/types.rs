@@ -104,6 +104,18 @@ impl Keyshare {
         self.0.threshold
     }
 
+    pub fn num_parties(&self) -> u8 {
+        self.0.total_parties
+    }
+
+    pub fn device_index(&self) -> u8 {
+        self.0.party_id
+    }
+
+    pub fn key_id(&self) -> Vec<u8> {
+        self.0.key_id.to_vec()
+    }
+
     pub fn equals(&self, other: &Keyshare) -> bool {
         // We can't compare the Arcs directly as they might point to different allocations
         // but identical content. However, Keyshare doesn't implement PartialEq (it wraps a foreign type).
@@ -117,10 +129,7 @@ impl Keyshare {
         self.to_bytes().hash(&mut hasher);
         hasher.finish()
     }
-}
 
-#[uniffi::export]
-impl Keyshare {
     pub fn vk(&self) -> NodeVerifyingKey {
         VerifyingKey::from_affine(self.0.public_key().to_affine())
             .unwrap()
