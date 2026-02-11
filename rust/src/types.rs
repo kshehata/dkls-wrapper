@@ -205,6 +205,10 @@ impl Signature {
         self.0.to_bytes().to_vec()
     }
 
+    pub fn to_der(&self) -> Vec<u8> {
+        self.0.to_der().as_bytes().to_vec()
+    }
+
     pub fn equals(&self, other: &Signature) -> bool {
         self == other
     }
