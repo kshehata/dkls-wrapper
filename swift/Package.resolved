@@ -1,6 +1,15 @@
 {
-  "originHash" : "4197ed8ce0b6c5f1e85fa7538d2a70b8bb5b2f9cacb497092a24ce952ba6e985",
+  "originHash" : "5cd661ace0ab8256b8c0edf88a7eee68a89199ccbca3653572c7c62a36deb788",
   "pins" : [
+    {
+      "identity" : "base45-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ehn-dcc-development/base45-swift.git",
+      "state" : {
+        "revision" : "c1db97d793d02a1c3d56d50a738c8fd8c34372f8",
+        "version" : "1.1.0"
+      }
+    },
     {
       "identity" : "mqtt-nio",
       "kind" : "remoteSourceControl",

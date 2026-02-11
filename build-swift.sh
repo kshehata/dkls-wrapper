@@ -71,6 +71,10 @@ cargo run --bin uniffi-bindgen-swift -- \
     --module-name "${PACKAGE}FFI" \
     --modulemap-filename module.modulemap
 
+# HACK: make Swift classes final
+sed -i '' 's/^open class /public final class /' target/xcframework_headers/*.swift
+sed -i '' 's/^open func /public func /' target/xcframework_headers/*.swift
+
 # Move the swift files to the right place
 mv target/xcframework_headers/*.swift ../swift/Sources/$SWIFT_PACKAGE/
 

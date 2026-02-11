@@ -94,6 +94,11 @@ impl SignRequest {
         Self::for_message_bytes(instance, message.as_bytes().to_vec(), vk, sk)
     }
 
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, GeneralError> {
+        Self::try_from(bytes.as_slice())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
     }

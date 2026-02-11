@@ -3,10 +3,6 @@ import Testing
 
 @testable import DKLSLib
 
-@Test func example() async throws {
-    #expect(swift_add(left: 2, right: 2) == 4)
-}
-
 actor TestMemoryBridge {
     var listeners: [UUID: AsyncStream<Data>.Continuation] = [:]
 
@@ -359,5 +355,52 @@ final class MockNetworkInterface: NetworkInterface {
     let tester = NetworkInterfaceTester(interface: network_interface)
     await #expect(throws: GeneralError.self) {
         try await tester.testRelay(data: Data([1, 2, 3, 4]))
+    }
+}
+
+@Test func testConformances() async throws {
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
+
+    // 1. InstanceId
+    let id1 = InstanceId.fromEntropy()
+    let data1 = try encoder.encode(id1)
+    let id2 = try decoder.decode(InstanceId.self, from: data1)
+    #expect(id1 == id2)
+    #expect(id1.hashValue == id2.hashValue)
+    #expect(id1.id == id1.toBytes())
+
+    // 2. DeviceInfo & NodeVerifyingKey
+    let sk = NodeSecretKey.fromEntropy()
+    let vk1 = NodeVerifyingKey.fromSk(sk: sk)
+
+    // Test NodeVerifyingKey Codable
+    let vkData = try encoder.encode(vk1)
+    let vk2 = try decoder.decode(NodeVerifyingKey.self, from: vkData)
+    #expect(vk1 == vk2)
+    #expect(vk1.hashValue == vk2.hashValue)
+
+    let infoA = DeviceInfo.forVk(friendlyName: "DeviceA", vk: vk1)
+    let infoData = try encoder.encode(infoA)
+    let infoB = try decoder.decode(DeviceInfo.self, from: infoData)
+    #expect(infoA == infoB)
+    #expect(infoA.hashValue == infoB.hashValue)
+    #expect(infoA.id == vk1)
+
+    // 3. QrData
+    let qr1 = QrData(instance: id1, threshold: 3, deviceIndex: 1, vk: vk1)
+    let qrData = try encoder.encode(qr1)
+    let qr2 = try decoder.decode(QrData.self, from: qrData)
+    #expect(qr1 == qr2)
+    #expect(qr1.hashValue == qr2.hashValue)
+    #expect(qr1.id == qr1.toBytes())
+
+    // 4. DeviceLocalData
+    if let data = try? genLocalData(t: 2, n: 3) {
+        let node1Data = data[0]
+        let localDataBytes = try encoder.encode(node1Data)
+        let node1DataClone = try decoder.decode(DeviceLocalData.self, from: localDataBytes)
+        #expect(node1Data == node1DataClone)
+        #expect(node1Data.hashValue == node1DataClone.hashValue)
     }
 }

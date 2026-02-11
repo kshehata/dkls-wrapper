@@ -7,6 +7,7 @@ use signature::{Signer, Verifier};
 use std::sync::Arc;
 
 use crate::error::GeneralError;
+use std::hash::{Hash, Hasher};
 
 /*****************************************************************************
  * Wrappers for basic types.
@@ -50,6 +51,16 @@ impl InstanceId {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.0.to_vec()
     }
+
+    pub fn equals(&self, other: &InstanceId) -> bool {
+        self == other
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 impl Into<sl_dkls23::InstanceId> for InstanceId {
@@ -91,6 +102,20 @@ impl Keyshare {
 
     pub fn threshold(&self) -> u8 {
         self.0.threshold
+    }
+
+    pub fn equals(&self, other: &Keyshare) -> bool {
+        // We can't compare the Arcs directly as they might point to different allocations
+        // but identical content. However, Keyshare doesn't implement PartialEq (it wraps a foreign type).
+        // Let's assume for now we can compare the bytes.
+        self.to_bytes() == other.to_bytes()
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Since we don't have Hash on the inner type easily, hash the bytes.
+        self.to_bytes().hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -137,7 +162,7 @@ impl<'de> Deserialize<'de> for Keyshare {
  * Signatures.
  *****************************************************************************/
 
-#[derive(Debug, Clone, PartialEq, uniffi::Object)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
 pub struct Signature(pub k256::ecdsa::Signature);
 
 impl TryFrom<&[u8]> for Signature {
@@ -178,6 +203,18 @@ impl Signature {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         self.0.to_bytes().to_vec()
+    }
+
+    pub fn equals(&self, other: &Signature) -> bool {
+        self == other
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Signature doesn't implement Hash in k256 either usually, but let's check.
+        // If not, hash bytes.
+        self.to_bytes().hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -319,6 +356,16 @@ impl NodeVerifyingKey {
             .verify(msg, &sig.0)
             .map_err(|e| GeneralError::SignatureError(e.to_string()))
     }
+
+    pub fn equals(&self, other: &NodeVerifyingKey) -> bool {
+        self == other
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 impl TryFrom<&[u8]> for NodeVerifyingKey {
@@ -437,7 +484,7 @@ impl DeviceInfo {
 impl DeviceInfo {
     // For UniFFI clients to be able to construct from an Arc.
     #[uniffi::constructor]
-    pub fn init(friendly_name: String, vk: Arc<NodeVerifyingKey>) -> Self {
+    pub fn for_vk(friendly_name: String, vk: Arc<NodeVerifyingKey>) -> Self {
         Self {
             friendly_name,
             vk: Arc::unwrap_or_clone(vk),
@@ -463,6 +510,25 @@ impl DeviceInfo {
 
     pub fn vk(&self) -> NodeVerifyingKey {
         self.vk.clone()
+    }
+
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GeneralError> {
+        postcard::from_bytes(bytes).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap()
+    }
+
+    pub fn equals(&self, other: &DeviceInfo) -> bool {
+        self == other
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -523,6 +589,17 @@ impl DeviceLocalData {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).unwrap()
+    }
+
+    // TODO: these last two are a hack for Swift. Check if we really need this.
+    pub fn equals(&self, other: &DeviceLocalData) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+
+    pub fn ffi_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.to_bytes().hash(&mut hasher);
+        hasher.finish()
     }
 }
 
