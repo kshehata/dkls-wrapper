@@ -71,7 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let mut mqtt_client = MQTTClientWrapper::new(&args.mqtt_host, args.mqtt_port, "sign");
-    let net_interface = mqtt_client.subscribe("sign/").await;
+    let net_interface = mqtt_client
+        .subscribe(&format!("sign/{}", hex::encode(local_data.key_id())))
+        .await;
     tokio::spawn(async move {
         mqtt_client.event_loop().await;
     });

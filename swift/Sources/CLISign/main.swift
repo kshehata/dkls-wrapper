@@ -70,6 +70,8 @@ let client = MQTTClient(
     configuration: .init(version: .v5_0)
 )
 
+let keyIdStr = hexString(localData.keyId())
+
 print(colorize("Connecting to MQTT broker...", .yellow))
 do {
     _ = try await client.connect().get()
@@ -83,7 +85,7 @@ do {
 print(colorize("👂 Listening for messages...", .yellow))
 let netInterface = MQTTInterface(
     client: client,
-    topic: "sign/"
+    topic: "sign/" + keyIdStr
 )
 
 let signNode = SignNode(ctx: localData)
