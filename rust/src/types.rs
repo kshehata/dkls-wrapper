@@ -136,6 +136,57 @@ impl Keyshare {
             .unwrap()
             .into()
     }
+
+    // Needed for mocking in higher level code.
+    #[uniffi::constructor]
+    pub fn dummy(n: u8, t: u8, my_index: u8) -> Self {
+        use sl_dkls23::keygen::Keyshare as InnerKeyshare;
+
+        // 1. Create a base keyshare using the library method ensures correct sizes/offsets
+        // for "OtherParty" which turned out to be quite large (65600 bytes).
+        let base_share = InnerKeyshare::new(n, t, my_index, &[]);
+
+        // 2. Clone the buffer to modify it
+        let mut buffer = base_share.as_slice().to_vec();
+
+        // 3. Init RNG
+        let mut rng = ChaCha20Rng::from_entropy();
+
+        // 4. Overwrite KeyshareInfo fields with random/valid data
+        // KeyshareInfo layout offsets (verified):
+        // 0..4: magic
+        // 4..8: extra
+        // 8: total_parties
+        // 9: threshold
+        // 10: party_id
+        // 11..43: final_session_id
+        // 43..75: root_chain_code
+        // 75..108: public_key (33 bytes)
+        // 108..140: key_id
+        // 140..172: s_i
+
+        // final_session_id (random 32 bytes)
+        rng.fill(&mut buffer[11..43]);
+
+        // root_chain_code (random 32 bytes)
+        rng.fill(&mut buffer[43..75]);
+
+        // public_key (valid compressed point, 33 bytes)
+        let sk = SigningKey::random(&mut rng);
+        let pk = VerifyingKey::from(&sk);
+        let pk_bytes = pk.to_encoded_point(true);
+        buffer[75..108].copy_from_slice(pk_bytes.as_bytes());
+
+        // key_id (random 32 bytes)
+        rng.fill(&mut buffer[108..140]);
+
+        // s_i (valid scalar, 32 bytes)
+        let scalar_bytes = sk.to_bytes();
+        buffer[140..172].copy_from_slice(&scalar_bytes);
+
+        // 5. Create valid wrapper
+        Self::from_bytes(&buffer).expect("Failed to produce dummy keyshare")
+    }
 }
 
 impl TryFrom<&[u8]> for Keyshare {
@@ -625,6 +676,30 @@ impl DeviceLocalData {
         self.to_bytes().hash(&mut hasher);
         hasher.finish()
     }
+
+    #[uniffi::constructor]
+    pub fn dummy(n: u8, t: u8, my_index: u8) -> Self {
+        let keyshare = Keyshare::dummy(n, t, my_index);
+        let sk = NodeSecretKey::from_entropy();
+
+        let devices = (0..n)
+            .into_iter()
+            .map(|i| {
+                if i == my_index {
+                    Arc::new(DeviceInfo::for_sk("My Device".to_string(), &sk))
+                } else {
+                    Arc::new(DeviceInfo::dummy(format!("Device{}", i), i % 2 == 0))
+                }
+            })
+            .collect::<DeviceList>();
+
+        Self {
+            keyshare,
+            my_index,
+            sk,
+            devices,
+        }
+    }
 }
 
 impl DeviceLocalData {
@@ -646,5 +721,42 @@ impl TryFrom<&str> for DeviceLocalData {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         serde_json::from_str(value).map_err(|e| GeneralError::InvalidInput(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dummy_device_local_data() {
+        let device_data = DeviceLocalData::dummy(3, 2, 1);
+
+        // Verify basic fields
+        assert_eq!(device_data.my_index, 1);
+        assert_eq!(device_data.threshold(), 2);
+        assert_eq!(device_data.get_device_list().len(), 3);
+
+        // Verify devices
+        assert_eq!(device_data.devices[0].name(), "Device0");
+        assert_eq!(device_data.devices[1].name(), "My Device");
+        assert_eq!(device_data.devices[2].name(), "Device2");
+        assert_eq!(device_data.devices[0].is_verified(), true);
+        assert_eq!(device_data.devices[1].is_verified(), false);
+        assert_eq!(device_data.devices[2].is_verified(), true);
+
+        // Verify Keyshare access
+        let keyshare = &device_data.keyshare;
+        assert_eq!(keyshare.threshold(), 2);
+        assert_eq!(keyshare.num_parties(), 3);
+        assert_eq!(keyshare.device_index(), 1);
+
+        // Verify VK validity
+        let vk = keyshare.vk();
+        assert!(!vk.to_bytes().is_empty());
+
+        // Check group VK
+        let group_vk = device_data.group_vk();
+        assert_eq!(vk.to_bytes(), group_vk.to_bytes());
     }
 }
