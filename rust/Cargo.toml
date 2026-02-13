@@ -24,7 +24,7 @@ rand_core = "0.6"
 tokio = "1.48.0"
 sl-mpc-mate = { version = "1.0.0-beta", features = ["simple-relay"] }
 hex = "0.4.3"
-k256 = { version = "0.13.4", features = ["ecdsa"] }
+k256 = { version = "0.13.4", features = ["ecdsa", "pem"] }
 thiserror = "1.0"
 futures = "0.3.31"
 async-trait = "0.1.89"
