@@ -197,3 +197,30 @@ extension QrData: Equatable, Hashable, Identifiable, Codable {
         self.init(unsafeFromHandle: temp.uniffiCloneHandle())
     }
 }
+
+// MARK: - SignRequest
+extension SignRequest: Equatable, Hashable, Identifiable, Codable {
+    public static func == (lhs: SignRequest, rhs: SignRequest) -> Bool {
+        return lhs.equals(other: rhs)
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(self.toBytes())
+    }
+
+    public var id: Data {
+        return instance().toBytes()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self.toBytes())
+    }
+
+    public convenience init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let bytes = try container.decode(Data.self)
+        let temp = try QrData.fromBytes(bytes: bytes)
+        self.init(unsafeFromHandle: temp.uniffiCloneHandle())
+    }
+}

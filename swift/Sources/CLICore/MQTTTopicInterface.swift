@@ -3,7 +3,7 @@ import Foundation
 import MQTTNIO
 import NIO
 
-public class MQTTInterface: NetworkInterface {
+public final class MQTTInterface: NetworkInterface, @unchecked Sendable {
     private let client: MQTTClient
     private let topic: String
     private let retainOnSend: Bool

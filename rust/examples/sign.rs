@@ -1,9 +1,9 @@
 use clap::Parser;
-use dkls::sign::SignNode;
-use dkls::types::{find_device_by_vk, DeviceLocalData, NodeVerifyingKey, Signature};
-
-use std::io::{self, Write};
-use std::sync::Arc;
+use dkls::sign::{SignMessageType, SignNode, SignRequest, SignRequestListener};
+use dkls::types::DeviceLocalData;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -15,14 +15,6 @@ struct Args {
     /// Keyshare filename.
     keyshare_filename: String,
 
-    /// Message to sign.
-    #[arg(short, long, default_value = "")]
-    message: String,
-
-    /// Assume yes for any confirmation prompts.
-    #[arg(short = 'y', long)]
-    skip_confirmation: bool,
-
     /// MQTT host.
     #[arg(long, default_value = "localhost")]
     mqtt_host: String,
@@ -32,16 +24,85 @@ struct Args {
     mqtt_port: u16,
 }
 
-fn verify_sig(sig: &Signature, message: &[u8], vk: &NodeVerifyingKey) {
-    println!("✓ Signature generated");
-    println!();
-    println!("Signature bytes: {} bytes", sig.to_bytes().len());
-    println!("{}", hex::encode(sig.to_bytes()));
-    println!();
+struct AppState {
+    // Store pending requests in a Vec to access by index.
+    // Index 0 = Request #1
+    pending_requests: Mutex<Vec<Arc<SignRequest>>>,
+}
 
-    match vk.verify(message, sig) {
-        Ok(_) => println!("✓ Signature verified"),
-        Err(e) => println!("Error: Signature verification failed: {:?}", e),
+struct ConsoleListener {
+    state: Arc<AppState>,
+    local_data: Arc<DeviceLocalData>,
+    tx: mpsc::Sender<()>, // Signal main loop to print prompt again or something?
+                          // Actually just printing to stdout is enough.
+}
+
+use dkls::types::find_device_by_vk;
+
+impl SignRequestListener for ConsoleListener {
+    fn receive_sign_request(&self, req: Arc<SignRequest>) {
+        println!("\n*** NEW SIGN REQUEST ***");
+        let index = {
+            let mut lock = self.state.pending_requests.lock().unwrap();
+            lock.push(req.clone());
+            lock.len() - 1
+        };
+
+        if let Some(msg) = req.get_message() {
+            match msg {
+                SignMessageType::String(s) => println!("Message: {}", s),
+                SignMessageType::Bytes(b) => println!("Bytes: {:?}", b),
+            }
+        }
+
+        // Print sender information if available
+        let party_vks = req.party_vk();
+        if !party_vks.is_empty() {
+            let vk = &party_vks[0];
+            let name = find_device_by_vk(&self.local_data.devices, vk)
+                .map(|d| d.name())
+                .unwrap_or_else(|| "Unknown Device".to_string());
+            println!("From: {} (VK: {})", name, hex::encode(vk.to_bytes()));
+        }
+
+        println!(
+            "Request Added as #{}. ID: {}",
+            index,
+            hex::encode(req.instance)
+        );
+        println!("Type 'a {}' to approve.", index);
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+
+        // Notify main loop? Not strictly needed for cli.
+        let _ = self.tx.try_send(());
+    }
+}
+
+use dkls::error::GeneralError;
+use dkls::sign::SignResultListener;
+use dkls::types::Signature;
+
+impl SignResultListener for ConsoleListener {
+    fn sign_result(&self, req: Arc<SignRequest>, result: Arc<Signature>) {
+        println!("\n*** SIGNATURE GENERATED ***");
+        println!("Instance ID: {}", hex::encode(req.instance));
+        println!("Signature: {}", hex::encode(result.to_bytes()));
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        let _ = self.tx.try_send(());
+    }
+
+    fn sign_error(&self, req: Arc<SignRequest>, error: GeneralError) {
+        println!("\n*** SIGNING ERROR ***");
+        println!("Instance ID: {}", hex::encode(req.instance));
+        println!("Error: {:?}", error);
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        let _ = self.tx.try_send(());
     }
 }
 
@@ -50,8 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("DKLS CLI Signing Test (Rust)");
-    println!();
+    println!("DKLS CLI Signing Tool");
+    println!("Loading keyshare from {}...", args.keyshare_filename);
 
     let local_data_bytes = tokio::fs::read(&args.keyshare_filename)
         .await
@@ -65,96 +126,158 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
     let local_data = Arc::new(local_data);
+    println!("Loaded ID: {}", hex::encode(local_data.key_id()));
 
-    println!("MQTT host: {}", args.mqtt_host);
-    println!("MQTT port: {}", args.mqtt_port);
-    println!();
-
+    // Setup MQTT
     let mut mqtt_client = MQTTClientWrapper::new(&args.mqtt_host, args.mqtt_port, "sign");
-    let net_interface = mqtt_client
-        .subscribe(&format!("sign/{}", hex::encode(local_data.key_id())))
-        .await;
+    // Connect to specific topic for this device
+    let topic = format!("sign/{}", hex::encode(local_data.key_id()));
+    println!("Subscribing to {}", topic);
+    let net_interface = mqtt_client.subscribe(&topic).await;
+
+    // Run MQTT loop
     tokio::spawn(async move {
         mqtt_client.event_loop().await;
     });
 
-    println!("👂 Listening for messages...");
+    // Create SignNode
+    let sign_node = Arc::new(SignNode::new(local_data.clone(), net_interface));
 
-    let sign_node = SignNode::new(local_data.clone());
+    // Setup state and listener
+    let state = Arc::new(AppState {
+        pending_requests: Mutex::new(Vec::new()),
+    });
 
-    if args.message.is_empty() {
-        // Listener Loop
-        loop {
-            match sign_node.get_next_req(net_interface.clone()).await {
-                Ok(req) => {
-                    if let Err(e) = req.check_sigs() {
-                        eprintln!("Error checking sigs: {:?}", e);
-                        continue;
-                    }
-                    println!("Received signature request:");
-                    println!("InstanceID: {:?}", req.instance);
+    let (tx, mut rx) = mpsc::channel(1);
+    let listener = ConsoleListener {
+        state: state.clone(),
+        local_data: local_data.clone(),
+        tx: tx.clone(),
+    };
+    sign_node.set_listener(Box::new(listener));
 
-                    println!("Message:");
-                    let msg_bytes = req.message();
-                    if let Ok(msg_str) = String::from_utf8(msg_bytes.clone()) {
-                        println!("{}", msg_str);
-                    } else {
-                        println!("{:?}", msg_bytes);
-                    }
+    // Create another listener for results (using same state/tx)
+    let result_listener = ConsoleListener {
+        state: state.clone(),
+        local_data: local_data.clone(),
+        tx: tx.clone(),
+    };
+    sign_node.set_result_listener(Box::new(result_listener));
 
-                    if req.party_vk.len() != 1 {
-                        eprintln!("ERROR: Request has {} signatures", req.party_vk.len());
-                        continue;
-                    }
+    // Run SignNode message loop
+    let node_clone = sign_node.clone();
+    tokio::spawn(async move {
+        if let Err(e) = node_clone.message_loop().await {
+            eprintln!("Message loop error: {:?}", e);
+        }
+    });
 
-                    let device = find_device_by_vk(&local_data.get_device_list(), &req.party_vk[0]);
-                    if let Some(d) = &device {
-                        println!("From: {}", d.name());
-                    } else {
-                        println!("WARNING: Request from unknown device");
-                    }
+    println!("Ready.");
+    println!("Commands:");
+    println!("  s, sign <message>    - Request signature for a string message");
+    println!("  a, approve <index>   - Approve a pending request by index");
+    println!("  l, list              - List pending requests");
+    println!("  x, exit              - Exit");
 
-                    if device.is_some() && args.skip_confirmation {
-                        println!("Skipping confirmation");
-                    } else {
-                        print!("Approve? [y/N] ");
-                        io::stdout().flush().unwrap();
-                        let mut input = String::new();
-                        io::stdin().read_line(&mut input).unwrap();
-                        if input.trim().to_lowercase() != "y" {
-                            continue;
-                        }
-                    }
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
 
-                    match sign_node
-                        .do_join_request(Arc::new(req), net_interface.clone())
-                        .await
-                    {
-                        Ok(sig) => {
-                            verify_sig(&sig, &msg_bytes, &local_data.group_vk());
-                            break;
-                        }
-                        Err(e) => eprintln!("Error: {:?}", e),
-                    }
+    print!("> ");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+
+    loop {
+        tokio::select! {
+            _ = rx.recv() => {
+                // Just woke up from listener notification, prompt is already printed by listener
+            }
+            res = reader.read_line(&mut line) => {
+                if res? == 0 {
+                    break; // EOF
                 }
-                Err(e) => eprintln!("Error waiting for request: {:?}", e),
+
+                let input = line.trim();
+                if input.is_empty() {
+                    line.clear();
+                    print!("> ");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
+
+                let parts: Vec<&str> = input.split_whitespace().collect();
+                let params = if parts.len() > 1 {
+                    input[parts[0].len()..].trim().to_string()
+                } else {
+                    String::new()
+                };
+
+                match parts[0] {
+                    "s" | "sign" => {
+                        if params.is_empty() {
+                            println!("Usage: s <message>");
+                        } else {
+                            println!("Requesting signature for: '{}'", params);
+                            if let Err(e) = sign_node.request_sign_string(params).await {
+                                eprintln!("Error requesting signature: {:?}", e);
+                            } else {
+                                println!("Request sent. Waiting for approval...");
+                            }
+                        }
+                    }
+                    "a" | "approve" => {
+                        if let Ok(idx) = params.parse::<usize>() {
+                            let req = {
+                                let mut lock = state.pending_requests.lock().unwrap();
+                                if idx < lock.len() {
+                                    Some(lock.remove(idx))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(req) = req {
+                                println!("Approving request #{}...", idx);
+                                if let Err(e) = sign_node.accept_request(req).await {
+                                    eprintln!("Error approving: {:?}", e);
+                                    // Put it back? Or just assume failures means retry?
+                                    // For now, if accept fails, it's gone from list.
+                                } else {
+                                    println!("Approval sent.");
+                                }
+                            } else {
+                                println!("Invalid request index.");
+                            }
+                        } else {
+                            println!("Usage: a <index>");
+                        }
+                    }
+                    "l" | "list" => {
+                        let lock = state.pending_requests.lock().unwrap();
+                        if lock.is_empty() {
+                            println!("No pending requests.");
+                        } else {
+                            for (i, req) in lock.iter().enumerate() {
+                                print!("[{}] ", i);
+                                if let Some(SignMessageType::String(msg)) = req.get_message() {
+                                    print!("{}", msg);
+                                } else {
+                                    print!("<binary data>");
+                                }
+                                println!(" (ID: {})", hex::encode(req.instance));
+                            }
+                        }
+                    }
+                    "x" | "exit" | "quit" => break,
+                    _ => println!("Unknown command."),
+                }
+
+                line.clear();
+                print!("> ");
+                std::io::stdout().flush().unwrap();
             }
         }
-    } else {
-        // Requester
-        println!("Requesting signature for message: {}", args.message);
-        let message_bytes = args.message.as_bytes().to_vec();
-        match sign_node
-            .do_sign_bytes(message_bytes.clone(), net_interface.clone())
-            .await
-        {
-            Ok(sig) => verify_sig(&sig, &message_bytes, &local_data.group_vk()),
-            Err(e) => eprintln!("Error: {:?}", e),
-        }
     }
-
-    // Disconnect logic is handled by dropping client? rumqttc handles it.
-    println!("Goodbye!");
 
     Ok(())
 }
