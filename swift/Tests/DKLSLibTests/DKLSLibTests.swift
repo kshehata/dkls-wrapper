@@ -174,9 +174,6 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
     let data = genLocalData(t: 2, n: 3)
     let message = "Hello World"
 
-    // Create SignNodes
-    let nodes = data.map { SignNode(ctx: $0) }
-
     // Setup network
     let bridge = TestMemoryBridge()
     var interfaces: [BridgeNetworkInterface] = []
@@ -187,25 +184,98 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
         interfaces.append(net)
     }
 
+    // Helper listener to capture events
+    class AsyncSignListener: SignRequestListener, SignResultListener {
+        var reqContinuation: AsyncStream<SignRequest>.Continuation?
+        var resContinuation: AsyncStream<Signature>.Continuation?
+
+        let reqStream: AsyncStream<SignRequest>
+        let resStream: AsyncStream<Signature>
+
+        init() {
+            var reqCont: AsyncStream<SignRequest>.Continuation!
+            self.reqStream = AsyncStream { reqCont = $0 }
+            self.reqContinuation = reqCont
+
+            var resCont: AsyncStream<Signature>.Continuation!
+            self.resStream = AsyncStream { resCont = $0 }
+            self.resContinuation = resCont
+        }
+
+        func receiveSignRequest(req: SignRequest) {
+            reqContinuation?.yield(req)
+        }
+
+        func signResult(req: SignRequest, result: Signature) {
+            resContinuation?.yield(result)
+        }
+
+        func signError(req: SignRequest, error: GeneralError) {
+            // print("Sign error: \(error)")
+        }
+
+        func nextRequest() async -> SignRequest? {
+            var iter = reqStream.makeAsyncIterator()
+            return await iter.next()
+        }
+
+        func nextResult() async -> Signature? {
+            var iter = resStream.makeAsyncIterator()
+            return await iter.next()
+        }
+    }
+
     // Node 0 starts a signature request
     // We use a TaskGroup to run them all
     try await withThrowingTaskGroup(of: Signature?.self) { group in
         // Node 0 (Originator)
         group.addTask {
-            return try await nodes[0].doSignString(string: message, netIf: interfaces[0])
+            let node = SignNode(ctx: data[0], netIf: interfaces[0])
+            let listener = AsyncSignListener()
+            node.setRequestListener(listener: listener)
+            node.setResultListener(listener: listener)
+
+            // Run message loop in background
+            let loopTask = Task {
+                try await node.messageLoop()
+            }
+
+            // Start request
+            try await node.requestSignString(message: message)
+
+            // Wait for result
+            let sig = await listener.nextResult()
+            loopTask.cancel()
+            return sig
         }
 
         // Node 1 (Joiner)
         group.addTask {
-            let req = try await nodes[1].getNextReq(netIf: interfaces[1])
-            return try await nodes[1].doJoinRequest(req: req, netIf: interfaces[1])
+            let node = SignNode(ctx: data[1], netIf: interfaces[1])
+            let listener = AsyncSignListener()
+            node.setRequestListener(listener: listener)
+            node.setResultListener(listener: listener)
+
+            // Run message loop in background
+            let loopTask = Task {
+                try await node.messageLoop()
+            }
+
+            // Wait for request
+            if let req = await listener.nextRequest() {
+                try await node.acceptRequest(req: req)
+                // Wait for result
+                let sig = await listener.nextResult()
+                loopTask.cancel()
+                return sig
+            }
+            loopTask.cancel()
+            return nil
         }
 
         // Node 2 (Joiner) -- Wait we only need threshold 2.
         // But let's have everyone join or just 2?
         // If we only run 2, the test should pass.
-
-        // Let's just run 2 nodes since T=2
 
         // Collect results
         var sig: Signature? = nil

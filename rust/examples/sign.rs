@@ -149,12 +149,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let (tx, mut rx) = mpsc::channel(1);
-    let listener = ConsoleListener {
+    let request_listener = ConsoleListener {
         state: state.clone(),
         local_data: local_data.clone(),
         tx: tx.clone(),
     };
-    sign_node.set_listener(Box::new(listener));
+    sign_node.set_request_listener(Box::new(request_listener));
 
     // Create another listener for results (using same state/tx)
     let result_listener = ConsoleListener {

@@ -161,7 +161,7 @@ struct SignCLI {
         let signNode = SignNode(ctx: localData, netIf: netInterface)
         let listener = ConsoleListener(localData: localData)
 
-        signNode.setListener(listener: listener)
+        signNode.setRequestListener(listener: listener)
         signNode.setResultListener(listener: listener)
 
         // Run message loop in background

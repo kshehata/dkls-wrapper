@@ -370,7 +370,7 @@ pub struct SignNode {
     outgoing_reqs: Mutex<HashMap<InstanceId, Arc<SignRequest>>>,
     incoming_reqs: Mutex<HashMap<InstanceId, Arc<SignRequest>>>,
     accepted_reqs: Mutex<HashMap<InstanceId, Arc<SignRequest>>>,
-    listener: RwLock<Option<Box<dyn SignRequestListener>>>,
+    request_listener: RwLock<Option<Box<dyn SignRequestListener>>>,
     result_listener: RwLock<Option<Box<dyn SignResultListener>>>,
     net_if: Arc<dyn NetworkInterface>,
 }
@@ -384,14 +384,14 @@ impl SignNode {
             outgoing_reqs: Mutex::new(HashMap::new()),
             incoming_reqs: Mutex::new(HashMap::new()),
             accepted_reqs: Mutex::new(HashMap::new()),
-            listener: RwLock::new(None),
+            request_listener: RwLock::new(None),
             result_listener: RwLock::new(None),
             net_if,
         }
     }
 
-    pub fn set_listener(&self, listener: Box<dyn SignRequestListener>) {
-        self.listener.write().unwrap().replace(listener);
+    pub fn set_request_listener(&self, listener: Box<dyn SignRequestListener>) {
+        self.request_listener.write().unwrap().replace(listener);
     }
 
     pub fn set_result_listener(&self, listener: Box<dyn SignResultListener>) {
@@ -437,7 +437,7 @@ impl SignNode {
         // New request. First check whether to accept it.
 
         // If we don't have a listener, then no point queueing the request.
-        let guard = self.listener.read().unwrap();
+        let guard = self.request_listener.read().unwrap();
         let Some(listener) = guard.as_ref() else {
             return;
         };
@@ -642,8 +642,8 @@ mod tests {
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
         let node2 = Arc::new(SignNode::new(contexts[1].clone(), bridge.connect()));
 
-        let (listener, state) = SharedListener::new();
-        node2.set_listener(Box::new(listener));
+        let (request_listener, state) = SharedListener::new();
+        node2.set_request_listener(Box::new(request_listener));
 
         // Start message loops
         let n1 = node1.clone();
@@ -698,11 +698,11 @@ mod tests {
         let node2 = Arc::new(SignNode::new(contexts[1].clone(), bridge.connect()));
         let node3 = Arc::new(SignNode::new(contexts[2].clone(), bridge.connect()));
 
-        let (listener2, state2) = SharedListener::new();
-        node2.set_listener(Box::new(listener2));
+        let (request_listener2, state2) = SharedListener::new();
+        node2.set_request_listener(Box::new(request_listener2));
 
-        let (listener3, state3) = SharedListener::new();
-        node3.set_listener(Box::new(listener3));
+        let (request_listener3, state3) = SharedListener::new();
+        node3.set_request_listener(Box::new(request_listener3));
 
         // Start message loops
         let n1 = node1.clone();
@@ -765,8 +765,8 @@ mod tests {
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
 
         // Setup listener
-        let (listener, _state) = SharedListener::new();
-        node1.set_listener(Box::new(listener));
+        let (request_listener, _state) = SharedListener::new();
+        node1.set_request_listener(Box::new(request_listener));
 
         // Start request
         let msg = "test_sim_join_invalid_hash".to_string();
@@ -812,8 +812,8 @@ mod tests {
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
 
         // Setup listener
-        let (listener, _state) = SharedListener::new();
-        node1.set_listener(Box::new(listener));
+        let (request_listener, _state) = SharedListener::new();
+        node1.set_request_listener(Box::new(request_listener));
 
         // Unknown instance ID
         let instance = InstanceId::from_entropy();
@@ -935,8 +935,8 @@ mod tests {
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
         // Note: contexts[0] is us, contexts[1] is them.
 
-        let (listener, state) = SharedListener::new();
-        node1.set_listener(Box::new(listener));
+        let (request_listener, state) = SharedListener::new();
+        node1.set_request_listener(Box::new(request_listener));
 
         // 1. Receive Request from Node 1
         let instance = InstanceId::from_entropy();
@@ -1026,8 +1026,8 @@ mod tests {
         let bridge = InMemoryBridge::new();
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
 
-        let (listener, state) = SharedListener::new();
-        node1.set_listener(Box::new(listener));
+        let (request_listener, state) = SharedListener::new();
+        node1.set_request_listener(Box::new(request_listener));
 
         // Receive valid request
         let instance = InstanceId::from_entropy();
