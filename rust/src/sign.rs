@@ -31,7 +31,6 @@ pub fn hash_sig_req(instance: &InstanceId, msg_hash: &MessageHash) -> MessageHas
  *  * Add callbacks for change in status, e.g. joining, start, etc
  *  * Add callback for when a request start that wasn't joined
  *  * Ability to cancel requests (both outgoing and incoming)
- *  * Check that all VKs are unique on receive messages
  *  * Not sure if it makes more sense to move the network interface inside
  *    SignNode or not.
  *****************************************************************************/
@@ -66,6 +65,20 @@ impl SignMessageType {
         }
         hasher.finalize().into()
     }
+}
+
+// For UniFFI to get hashes
+
+#[uniffi::export]
+pub fn get_hash_string(msg: String) -> Vec<u8> {
+    let msg = SignMessageType::String(msg);
+    msg.get_hash().to_vec()
+}
+
+#[uniffi::export]
+pub fn get_hash_bytes(msg: Vec<u8>) -> Vec<u8> {
+    let msg = SignMessageType::Bytes(msg);
+    msg.get_hash().to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,7 +505,14 @@ impl SignNode {
                 "Not enough signatures".to_string(),
             ));
         }
-        // Assume vks are all unique and sigs checked already.
+
+        let mut vk_set = std::collections::HashSet::new();
+        if !req.sigs.iter().all(|(vk, _)| vk_set.insert(vk)) {
+            return Err(GeneralError::InvalidInput(
+                "Duplicate VKs in signature list".to_string(),
+            ));
+        }
+
         let Some(party_id) = req.sigs.iter().position(|(vk, _)| vk == self.ctx.my_vk()) else {
             return Err(GeneralError::InvalidInput("Our VK not in list".to_string()));
         };
