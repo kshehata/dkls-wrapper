@@ -206,6 +206,11 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             reqContinuation?.yield(req)
         }
 
+        func cancelSignRequest(req: SignRequest) {}
+        func signDevicesChanged(req: SignRequest) {}
+        func signDsgStarted(req: SignRequest) {}
+        func signCancelled(req: SignRequest) {}
+
         func signResult(req: SignRequest, result: Signature) {
             resContinuation?.yield(result)
         }
@@ -233,7 +238,6 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             let node = SignNode(ctx: data[0], netIf: interfaces[0])
             let listener = AsyncSignListener()
             node.setRequestListener(listener: listener)
-            node.setResultListener(listener: listener)
 
             // Run message loop in background
             let loopTask = Task {
@@ -241,7 +245,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             }
 
             // Start request
-            try await node.requestSignString(message: message)
+            try await node.requestSignString(message: message, listener: listener)
 
             // Wait for result
             let sig = await listener.nextResult()
@@ -254,7 +258,6 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             let node = SignNode(ctx: data[1], netIf: interfaces[1])
             let listener = AsyncSignListener()
             node.setRequestListener(listener: listener)
-            node.setResultListener(listener: listener)
 
             // Run message loop in background
             let loopTask = Task {
@@ -263,7 +266,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
 
             // Wait for request
             if let req = await listener.nextRequest() {
-                try await node.acceptRequest(req: req)
+                try await node.acceptRequest(req: req, listener: listener)
                 // Wait for result
                 let sig = await listener.nextResult()
                 loopTask.cancel()

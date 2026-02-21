@@ -78,6 +78,13 @@ impl SignRequestListener for ConsoleListener {
         // Notify main loop? Not strictly needed for cli.
         let _ = self.tx.try_send(());
     }
+
+    fn cancel_sign_request(&self, req: Arc<SignRequest>) {
+        println!("\n*** SIGN REQUEST CANCELLED ***");
+        let mut lock = self.state.pending_requests.lock().unwrap();
+        lock.retain(|r| r.instance != req.instance);
+        let _ = self.tx.try_send(());
+    }
 }
 
 use dkls::error::GeneralError;
@@ -85,10 +92,37 @@ use dkls::sign::SignResultListener;
 use dkls::types::Signature;
 
 impl SignResultListener for ConsoleListener {
+    fn sign_devices_changed(&self, req: Arc<SignRequest>) {
+        println!("\n*** SIGNING DEVICES CHANGED ***");
+        println!("Instance ID: {}", hex::encode(req.instance));
+        println!("Devices:");
+        for (vk, _) in &req.sigs {
+            let name = find_device_by_vk(&self.local_data.devices, vk)
+                .map(|d| d.name())
+                .unwrap_or_else(|| "Unknown Device".to_string());
+
+            println!("  {}", name);
+        }
+    }
+    fn sign_dsg_started(&self, req: Arc<SignRequest>) {
+        println!("\n*** SIGNING DSG STARTED ***");
+        println!("Instance ID: {}", hex::encode(req.instance));
+    }
+    fn sign_cancelled(&self, req: Arc<SignRequest>) {
+        println!("\n*** SIGNING CANCELLED BY ORIGINATOR ***");
+        println!("Instance ID: {}", hex::encode(req.instance));
+        let mut lock = self.state.pending_requests.lock().unwrap();
+        lock.retain(|r| r.instance != req.instance);
+    }
+
     fn sign_result(&self, req: Arc<SignRequest>, result: Arc<Signature>) {
         println!("\n*** SIGNATURE GENERATED ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         println!("Signature: {}", hex::encode(result.to_bytes()));
+        {
+            let mut lock = self.state.pending_requests.lock().unwrap();
+            lock.retain(|r| r.instance != req.instance);
+        }
         print!("> ");
         use std::io::Write;
         std::io::stdout().flush().unwrap();
@@ -99,6 +133,10 @@ impl SignResultListener for ConsoleListener {
         println!("\n*** SIGNING ERROR ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         println!("Error: {:?}", error);
+        {
+            let mut lock = self.state.pending_requests.lock().unwrap();
+            lock.retain(|r| r.instance != req.instance);
+        }
         print!("> ");
         use std::io::Write;
         std::io::stdout().flush().unwrap();
@@ -156,14 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     sign_node.set_request_listener(Box::new(request_listener));
 
-    // Create another listener for results (using same state/tx)
-    let result_listener = ConsoleListener {
-        state: state.clone(),
-        local_data: local_data.clone(),
-        tx: tx.clone(),
-    };
-    sign_node.set_result_listener(Box::new(result_listener));
-
     // Run SignNode message loop
     let node_clone = sign_node.clone();
     tokio::spawn(async move {
@@ -176,7 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Commands:");
     println!("  s, sign <message>    - Request signature for a string message");
     println!("  a, approve <index>   - Approve a pending request by index");
-    println!("  l, list              - List pending requests");
+    println!("  c, cancel <index>    - Cancel an outgoing, approved, or pending request");
+    println!("  l, list              - List pending, approved, and outgoing requests");
     println!("  x, exit              - Exit");
 
     let stdin = tokio::io::stdin();
@@ -218,19 +249,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("Usage: s <message>");
                         } else {
                             println!("Requesting signature for: '{}'", params);
-                            if let Err(e) = sign_node.request_sign_string(params).await {
-                                eprintln!("Error requesting signature: {:?}", e);
-                            } else {
-                                println!("Request sent. Waiting for approval...");
+                            let result_listener = ConsoleListener {
+                                state: state.clone(),
+                                local_data: local_data.clone(),
+                                tx: tx.clone(),
+                            };
+                            match sign_node.request_sign_string(params, Box::new(result_listener)).await {
+                                Ok(req) => {
+                                    println!("Request sent. Waiting for approval...");
+                                    let mut lock = state.pending_requests.lock().unwrap();
+                                    lock.push(req);
+                                }
+                                Err(e) => eprintln!("Error requesting signature: {:?}", e),
                             }
                         }
                     }
                     "a" | "approve" => {
                         if let Ok(idx) = params.parse::<usize>() {
                             let req = {
-                                let mut lock = state.pending_requests.lock().unwrap();
+                                let lock = state.pending_requests.lock().unwrap();
                                 if idx < lock.len() {
-                                    Some(lock.remove(idx))
+                                    Some(lock[idx].clone())
                                 } else {
                                     None
                                 }
@@ -238,18 +277,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if let Some(req) = req {
                                 println!("Approving request #{}...", idx);
-                                if let Err(e) = sign_node.accept_request(req).await {
+                                let result_listener = ConsoleListener {
+                                    state: state.clone(),
+                                    local_data: local_data.clone(),
+                                    tx: tx.clone(),
+                                };
+                                if let Err(e) = sign_node.accept_request(req, Box::new(result_listener)).await {
                                     eprintln!("Error approving: {:?}", e);
-                                    // Put it back? Or just assume failures means retry?
-                                    // For now, if accept fails, it's gone from list.
                                 } else {
                                     println!("Approval sent.");
+                                    // Kept in list until signature completes or is cancelled
                                 }
                             } else {
                                 println!("Invalid request index.");
                             }
                         } else {
                             println!("Usage: a <index>");
+                        }
+                    }
+                    "c" | "cancel" => {
+                        if let Ok(idx) = params.parse::<usize>() {
+                            let req = {
+                                let lock = state.pending_requests.lock().unwrap();
+                                if idx < lock.len() {
+                                    Some(lock[idx].clone())
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(req) = req {
+                                println!("Cancelling request #{}...", idx);
+                                if let Err(e) = sign_node.cancel_request(&req).await {
+                                    eprintln!("Error cancelling: {:?}", e);
+                                } else {
+                                    println!("Cancel processed.");
+                                    let mut lock = state.pending_requests.lock().unwrap();
+                                    lock.retain(|r| r.instance != req.instance);
+                                }
+                            } else {
+                                println!("Invalid request index.");
+                            }
+                        } else {
+                            println!("Usage: c <index>");
                         }
                     }
                     "l" | "list" => {

@@ -51,6 +51,11 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         print("\n*** SIGNATURE GENERATED ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Signature: \(hexString(result.toBytes()))")
+
+        lock.lock()
+        pendingRequests.removeAll { $0.instance() == req.instance() }
+        lock.unlock()
+
         print("> ", terminator: "")
         fflush(stdout)
     }
@@ -59,8 +64,61 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         print("\n*** SIGNING ERROR ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Error: \(error)")
+
+        lock.lock()
+        pendingRequests.removeAll { $0.instance() == req.instance() }
+        lock.unlock()
+
         print("> ", terminator: "")
         fflush(stdout)
+    }
+
+    func cancelSignRequest(req: SignRequest) {
+        print("\n*** SIGN REQUEST CANCELLED ***")
+        lock.lock()
+        pendingRequests.removeAll { $0.instance() == req.instance() }
+        lock.unlock()
+    }
+
+    func signDevicesChanged(req: SignRequest) {
+        print("\n*** SIGNING DEVICES CHANGED ***")
+        print("Instance ID: \(hexString(req.instance().toBytes()))")
+        print("Devices:")
+        for vk in req.partyVk() {
+            let name =
+                findDeviceByVk(devices: localData.getDeviceList(), vk: vk)?.name()
+                ?? "Unknown Device"
+            print("  \(name) (VK: \(hexString(vk.toBytes())))")
+        }
+    }
+
+    func signDsgStarted(req: SignRequest) {
+        print("\n*** SIGNING DSG STARTED ***")
+        print("Instance ID: \(hexString(req.instance().toBytes()))")
+    }
+
+    func signCancelled(req: SignRequest) {
+        print("\n*** SIGNING CANCELLED BY ORIGINATOR ***")
+        print("Instance ID: \(hexString(req.instance().toBytes()))")
+
+        lock.lock()
+        pendingRequests.removeAll { $0.instance() == req.instance() }
+        lock.unlock()
+
+        print("> ", terminator: "")
+        fflush(stdout)
+    }
+
+    func addPendingRequest(req: SignRequest) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingRequests.append(req)
+    }
+
+    func removePendingRequestByInstance(instance: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingRequests.removeAll { $0.instance().toBytes() == instance }
     }
 
     func getPendingRequest(index: Int) -> SignRequest? {
@@ -162,7 +220,6 @@ struct SignCLI {
         let listener = ConsoleListener(localData: localData)
 
         signNode.setRequestListener(listener: listener)
-        signNode.setResultListener(listener: listener)
 
         // Run message loop in background
         Task.detached {
@@ -177,7 +234,8 @@ struct SignCLI {
         print("Commands:")
         print("  s, sign <message>    - Request signature for a string message")
         print("  a, approve <index>   - Approve a pending request by index")
-        print("  l, list              - List pending requests")
+        print("  c, cancel <index>    - Cancel an outgoing, approved, or pending request")
+        print("  l, list              - List pending, approved, and outgoing requests")
         print("  x, exit              - Exit")
 
         print("> ", terminator: "")
@@ -202,8 +260,10 @@ struct SignCLI {
                 } else {
                     print("Requesting signature for: '\(params)'")
                     do {
-                        try await signNode.requestSignString(message: params)
+                        let req = try await signNode.requestSignString(
+                            message: params, listener: listener)
                         print("Request sent. Waiting for approval...")
+                        listener.addPendingRequest(req: req)
                     } catch {
                         print("Error requesting signature: \(error)")
                     }
@@ -213,9 +273,8 @@ struct SignCLI {
                 if let idx = Int(params) {
                     if let req = listener.getPendingRequest(index: idx) {
                         print("Approving request #\(idx)...")
-                        listener.removePendingRequest(index: idx)  // Remove from list immediately?
                         do {
-                            try await signNode.acceptRequest(req: req)
+                            try await signNode.acceptRequest(req: req, listener: listener)
                             print("Approval sent.")
                         } catch {
                             print("Error approving: \(error)")
@@ -225,6 +284,25 @@ struct SignCLI {
                     }
                 } else {
                     print("Usage: a <index>")
+                }
+
+            case "c", "cancel":
+                if let idx = Int(params) {
+                    if let req = listener.getPendingRequest(index: idx) {
+                        print("Cancelling request #\(idx)...")
+                        do {
+                            try await signNode.cancelRequest(req: req)
+                            print("Cancel processed.")
+                            listener.removePendingRequestByInstance(
+                                instance: req.instance().toBytes())
+                        } catch {
+                            print("Error cancelling: \(error)")
+                        }
+                    } else {
+                        print("Invalid request index.")
+                    }
+                } else {
+                    print("Usage: c <index>")
                 }
 
             case "l", "list":
