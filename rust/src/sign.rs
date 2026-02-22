@@ -382,7 +382,7 @@ pub async fn do_sign_relay<R: Relay>(
 // and when a request is cancelled before being accepted.
 #[uniffi::export(callback_interface)]
 pub trait SignRequestListener: Send + Sync {
-    fn receive_sign_request(&self, req: Arc<SignRequest>);
+    fn receive_sign_request(&self, req: Arc<SignRequest>, dev: Option<Arc<DeviceInfo>>);
     fn cancel_sign_request(&self, req: Arc<SignRequest>);
 }
 
@@ -390,7 +390,7 @@ pub trait SignRequestListener: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait SignResultListener: Send + Sync {
     // Devices involved in a signature changed.
-    fn sign_devices_changed(&self, req: Arc<SignRequest>);
+    fn sign_devices_changed(&self, req: Arc<SignRequest>, devices: Vec<Option<Arc<DeviceInfo>>>);
     // The actual DSG protocol started.
     fn sign_dsg_started(&self, req: Arc<SignRequest>);
     // Signature request was cancelled by originator.
@@ -518,7 +518,9 @@ impl SignNode {
                 .unwrap()
                 .insert(req.instance, req.clone());
         }
-        listener.receive_sign_request(req);
+        // Always have exactly 1 sig on a request.
+        let dev = find_device_by_vk(&self.ctx.devices, &req.sigs[0].0);
+        listener.receive_sign_request(req, dev);
     }
 
     // Received a join response, see if it's ours and if we're now ready.
@@ -533,7 +535,7 @@ impl SignNode {
         let (og_req, listener) = og_entry.get_mut();
         Arc::make_mut(og_req).update(req)?;
         // Alert the listener that the party list has changed.
-        listener.sign_devices_changed(og_req.clone());
+        self.notify_devices_changed(listener.as_ref(), og_req.clone());
 
         if og_req.sigs.len() >= self.ctx.threshold() as usize {
             // If we have enough parties to sign, then remove the
@@ -598,7 +600,7 @@ impl SignNode {
             // Remove the participant VK from the list.
             if og_req.check_matches(req).is_ok() {
                 Arc::make_mut(og_req).remove_vk(vk);
-                listener.sign_devices_changed(og_req.clone());
+                self.notify_devices_changed(listener.as_ref(), og_req.clone());
             }
         }
         // Check if we have an accepted request for this instance.
@@ -701,6 +703,8 @@ impl SignNode {
             self.ctx.my_vk(),
             &self.ctx.sk,
         ));
+        // Convenience: tell the listener about ourselves.
+        self.notify_devices_changed(listener.as_ref(), req.clone());
         {
             self.outgoing_reqs
                 .lock()
@@ -731,6 +735,16 @@ impl SignNode {
             .insert(og_req.instance, (og_req, listener));
         Ok(())
     }
+
+    // Internal helper to notify listeners of device changes.
+    fn notify_devices_changed(&self, listener: &dyn SignResultListener, req: Arc<SignRequest>) {
+        let devices = req
+            .sigs
+            .iter()
+            .map(|(vk, _)| find_device_by_vk(&self.ctx.devices, vk))
+            .collect::<Vec<_>>();
+        listener.sign_devices_changed(req.clone(), devices);
+    }
 }
 
 #[cfg(test)]
@@ -743,7 +757,9 @@ mod tests {
 
     struct SharedState {
         received_req: Mutex<Option<Arc<SignRequest>>>,
+        received_dev: Mutex<Option<Arc<DeviceInfo>>>,
         received_sig: Mutex<Option<Arc<Signature>>>,
+        received_devices: Mutex<Vec<Option<Arc<DeviceInfo>>>>,
         accept_signal: AtomicBool,
         sig_signal: AtomicBool,
         devices_changed_signal: AtomicBool,
@@ -759,7 +775,9 @@ mod tests {
         fn new() -> (Self, Arc<SharedState>) {
             let state = Arc::new(SharedState {
                 received_req: Mutex::new(None),
+                received_dev: Mutex::new(None),
                 received_sig: Mutex::new(None),
+                received_devices: Mutex::new(Vec::new()),
                 accept_signal: AtomicBool::new(false),
                 sig_signal: AtomicBool::new(false),
                 devices_changed_signal: AtomicBool::new(false),
@@ -776,8 +794,9 @@ mod tests {
     }
 
     impl SignRequestListener for SharedListener {
-        fn receive_sign_request(&self, req: Arc<SignRequest>) {
+        fn receive_sign_request(&self, req: Arc<SignRequest>, dev: Option<Arc<DeviceInfo>>) {
             *self.state.received_req.lock().unwrap() = Some(req);
+            *self.state.received_dev.lock().unwrap() = dev;
             self.state.accept_signal.store(true, Ordering::SeqCst);
         }
         fn cancel_sign_request(&self, _req: Arc<SignRequest>) {
@@ -786,7 +805,12 @@ mod tests {
     }
 
     impl SignResultListener for SharedListener {
-        fn sign_devices_changed(&self, _req: Arc<SignRequest>) {
+        fn sign_devices_changed(
+            &self,
+            _req: Arc<SignRequest>,
+            devices: Vec<Option<Arc<DeviceInfo>>>,
+        ) {
+            *self.state.received_devices.lock().unwrap() = devices;
             self.state
                 .devices_changed_signal
                 .store(true, Ordering::SeqCst);
@@ -843,11 +867,28 @@ mod tests {
 
         // Accept request on node2
         let req = state.received_req.lock().unwrap().take().unwrap();
+        let dev = state.received_dev.lock().unwrap().take().unwrap();
+        assert_eq!(dev.vk, *contexts[0].my_vk());
+        assert_eq!(dev.friendly_name, "device_0");
+
         let (res_listener_2, _res_state_2) = SharedListener::new();
         node2
             .accept_request(req, Box::new(res_listener_2))
             .await
             .unwrap();
+
+        let start = std::time::Instant::now();
+        while res_state.received_devices.lock().unwrap().len() < 2 {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for devices changed");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let devices = res_state.received_devices.lock().unwrap().clone();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].as_ref().unwrap().vk, *contexts[0].my_vk());
+        assert_eq!(devices[1].as_ref().unwrap().vk, *contexts[1].my_vk());
 
         // Wait for signature
         let start = std::time::Instant::now();
@@ -912,6 +953,10 @@ mod tests {
 
         // Accept request on other nodes
         let req2 = state2.received_req.lock().unwrap().take().unwrap();
+        let dev2 = state2.received_dev.lock().unwrap().take().unwrap();
+        assert_eq!(dev2.vk, *contexts[0].my_vk());
+        assert_eq!(dev2.friendly_name, "device_0");
+
         let (res_listener_2, _res_state_2) = SharedListener::new();
         node2
             .accept_request(req2, Box::new(res_listener_2))
@@ -919,11 +964,33 @@ mod tests {
             .unwrap();
 
         let req3 = state3.received_req.lock().unwrap().take().unwrap();
+        let dev3 = state3.received_dev.lock().unwrap().take().unwrap();
+        assert_eq!(dev3.vk, *contexts[0].my_vk());
+        assert_eq!(dev3.friendly_name, "device_0");
+
         let (res_listener_3, _res_state_3) = SharedListener::new();
         node3
             .accept_request(req3, Box::new(res_listener_3))
             .await
             .unwrap();
+
+        let start = std::time::Instant::now();
+        while res_state.received_devices.lock().unwrap().len() < 3 {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Timeout waiting for devices changed");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let devices = res_state.received_devices.lock().unwrap().clone();
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[0].as_ref().unwrap().vk, *contexts[0].my_vk());
+        assert!(devices
+            .iter()
+            .any(|d| d.as_ref().unwrap().vk == *contexts[1].my_vk()));
+        assert!(devices
+            .iter()
+            .any(|d| d.as_ref().unwrap().vk == *contexts[2].my_vk()));
 
         // Wait for signature
         let start = std::time::Instant::now();
@@ -1343,18 +1410,18 @@ mod tests {
             .await
             .unwrap();
 
-        // It accepted, Node1 should receive a Join and devices_changed might fire?
-        // Wait actually, does it fire sign_devices_changed?
+        // Wait for node1 to see node2 join
+        while state1_res_listener.received_devices.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         // Let's cancel from Node2 (participant)
         node2.cancel_request(&state2_req).await.unwrap();
 
-        // Wait for node1 to process cancel (should fire sign_devices_changed on result listener)
+        // Wait for node1 to process cancel (devices back to 1)
         let start = std::time::Instant::now();
-        while !state1_res_listener
-            .devices_changed_signal
-            .load(Ordering::SeqCst)
-        {
-            if start.elapsed() > Duration::from_secs(1) {
+        while state1_res_listener.received_devices.lock().unwrap().len() > 1 {
+            if start.elapsed() > Duration::from_secs(5) {
                 panic!("Timeout waiting for participant cancel on originator");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

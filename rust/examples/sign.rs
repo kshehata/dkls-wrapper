@@ -40,7 +40,11 @@ struct ConsoleListener {
 use dkls::types::find_device_by_vk;
 
 impl SignRequestListener for ConsoleListener {
-    fn receive_sign_request(&self, req: Arc<SignRequest>) {
+    fn receive_sign_request(
+        &self,
+        req: Arc<SignRequest>,
+        dev: Option<Arc<dkls::types::DeviceInfo>>,
+    ) {
         println!("\n*** NEW SIGN REQUEST ***");
         let index = {
             let mut lock = self.state.pending_requests.lock().unwrap();
@@ -56,13 +60,14 @@ impl SignRequestListener for ConsoleListener {
         }
 
         // Print sender information if available
-        let party_vks = req.party_vk();
-        if !party_vks.is_empty() {
-            let vk = &party_vks[0];
-            let name = find_device_by_vk(&self.local_data.devices, vk)
-                .map(|d| d.name())
-                .unwrap_or_else(|| "Unknown Device".to_string());
-            println!("From: {} (VK: {})", name, hex::encode(vk.to_bytes()));
+        if let Some(dev) = dev {
+            println!(
+                "From: {} (VK: {})",
+                dev.name(),
+                hex::encode(dev.vk.to_bytes())
+            );
+        } else {
+            println!("From: Unknown Device [WARNING]");
         }
 
         println!(
@@ -92,16 +97,20 @@ use dkls::sign::SignResultListener;
 use dkls::types::Signature;
 
 impl SignResultListener for ConsoleListener {
-    fn sign_devices_changed(&self, req: Arc<SignRequest>) {
+    fn sign_devices_changed(
+        &self,
+        req: Arc<SignRequest>,
+        devices: Vec<Option<Arc<dkls::types::DeviceInfo>>>,
+    ) {
         println!("\n*** SIGNING DEVICES CHANGED ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         println!("Devices:");
-        for (vk, _) in &req.sigs {
-            let name = find_device_by_vk(&self.local_data.devices, vk)
-                .map(|d| d.name())
-                .unwrap_or_else(|| "Unknown Device".to_string());
-
-            println!("  {}", name);
+        for dev_op in &devices {
+            if let Some(dev) = dev_op {
+                println!("  {}", dev.name());
+            } else {
+                println!("  Unknown Device [WARNING]");
+            }
         }
     }
     fn sign_dsg_started(&self, req: Arc<SignRequest>) {

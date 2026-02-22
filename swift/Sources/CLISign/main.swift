@@ -14,7 +14,7 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         self.localData = localData
     }
 
-    func receiveSignRequest(req: SignRequest) {
+    func receiveSignRequest(req: SignRequest, dev: DeviceInfo?) {
         print("\n*** NEW SIGN REQUEST ***")
 
         lock.lock()
@@ -32,13 +32,10 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         }
 
         // Print sender information if available
-        let partyVks = req.partyVk()
-        if !partyVks.isEmpty {
-            let vk = partyVks[0]
-            let name =
-                findDeviceByVk(devices: localData.getDeviceList(), vk: vk)?.name()
-                ?? "Unknown Device"
-            print("From: \(name) (VK: \(hexString(vk.toBytes())))")
+        if let dev = dev {
+            print("From: \(dev.name()) (VK: \(hexString(dev.vk().toBytes())))")
+        } else {
+            print("From: Unknown Device [WARNING]")
         }
 
         print("Request Added as #\(index). ID: \(hexString(req.instance().toBytes()))")
@@ -80,15 +77,16 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         lock.unlock()
     }
 
-    func signDevicesChanged(req: SignRequest) {
+    func signDevicesChanged(req: SignRequest, devices: [DeviceInfo?]) {
         print("\n*** SIGNING DEVICES CHANGED ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Devices:")
-        for vk in req.partyVk() {
-            let name =
-                findDeviceByVk(devices: localData.getDeviceList(), vk: vk)?.name()
-                ?? "Unknown Device"
-            print("  \(name) (VK: \(hexString(vk.toBytes())))")
+        for dev in devices {
+            if let dev = dev {
+                print("  \(dev.name())")
+            } else {
+                print("  Unknown Device [WARNING]")
+            }
         }
     }
 

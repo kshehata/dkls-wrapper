@@ -202,12 +202,12 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             self.resContinuation = resCont
         }
 
-        func receiveSignRequest(req: SignRequest) {
+        func receiveSignRequest(req: SignRequest, dev: DeviceInfo?) {
             reqContinuation?.yield(req)
         }
 
         func cancelSignRequest(req: SignRequest) {}
-        func signDevicesChanged(req: SignRequest) {}
+        func signDevicesChanged(req: SignRequest, devices: [DeviceInfo?]) {}
         func signDsgStarted(req: SignRequest) {}
         func signCancelled(req: SignRequest) {}
 
