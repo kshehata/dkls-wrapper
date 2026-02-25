@@ -375,7 +375,7 @@ pub async fn do_sign_relay<R: Relay>(
 ) -> Result<Signature, GeneralError> {
     let hash = setup_msg.hash;
     let party_vk = setup_msg.sigs.iter().map(|(k, _)| k).collect::<Vec<_>>();
-    println!("doing sig for msg hash {:?}", hex::encode(hash));
+    // println!("doing sig for msg hash {:?}", hex::encode(hash));
     let dsg_setup_msg = DsgSetupMessage::new(
         setup_msg.instance.into(),
         &ctx.sk,
@@ -614,10 +614,6 @@ impl SignNode {
     }
 
     pub fn receive_cancel(&self, cancel_msg: &SignSetupMessage) {
-        println!(
-            "receive_cancel: Instance ID: {}",
-            hex::encode(cancel_msg.instance)
-        );
         // Must have exactly one signature in a cancel message.
         let vk = &cancel_msg.sigs[0].0;
         // Check if we have an outgoing request for this instance.
@@ -627,13 +623,13 @@ impl SignNode {
             .unwrap()
             .get_mut(&cancel_msg.instance)
         {
-            println!("receive_cancel: checking outgoing_reqs");
             // Remove the participant VK from the list.
             if og_req.check_matches(cancel_msg).is_ok() {
                 Arc::make_mut(og_req).remove_vk(vk);
                 self.notify_devices_changed(listener.as_ref(), og_req.clone());
             }
         }
+
         // Check if we have an accepted request for this instance.
         if let Entry::Occupied(og_entry) = self
             .accepted_reqs
@@ -641,38 +637,30 @@ impl SignNode {
             .unwrap()
             .entry(cancel_msg.instance)
         {
-            println!("receive_cancel: found in accepted_reqs");
             let og_req = &og_entry.get().0;
             // The original request would only have had one VK so check that they match.
-            if og_req.check_matches(cancel_msg).is_ok() {
-                if og_req.has_vk(vk) {
-                    println!(
-                        "receive_cancel: has_vk matched, removing from accepted_reqs and firing"
-                    );
-                    let (og_req, listener) = og_entry.remove();
-                    listener.sign_cancelled(og_req);
-                } else {
-                    println!(
-                        "receive_cancel: has_vk FAILED! og_req vks: {:?}",
-                        og_req
-                            .sigs
-                            .iter()
-                            .map(|s| hex::encode(s.0.to_bytes()))
-                            .collect::<Vec<_>>()
-                    );
-                    println!("receive_cancel: search vk: {}", hex::encode(vk.to_bytes()));
-                }
-            } else {
+            if !og_req.check_matches(cancel_msg).is_ok() {
+                // Either the instance ID or hash mismatches.
+                // This should never happen. Instance ID must be the same for the
+                // hash map to match, and hash mismatch means a malformed message.
                 println!("receive_cancel: check_matches FAILED!");
+            } else if !og_req.has_vk(vk) {
+                // Got a cancel with a different VK than the original request.
+                // This is either a joining party backing out, or malformed.
+                // Either way, ignore it.
+            } else {
+                let (og_req, listener) = og_entry.remove();
+                listener.sign_cancelled(og_req);
             }
         };
+
+        // Check if we have a pending but not accepted request for this instance.
         if let Entry::Occupied(og_entry) = self
             .incoming_reqs
             .lock()
             .unwrap()
             .entry(cancel_msg.instance)
         {
-            println!("receive_cancel: found in incoming_reqs");
             if og_entry.get().check_matches(cancel_msg).is_ok() && og_entry.get().has_vk(vk) {
                 let og_req = og_entry.remove();
 
