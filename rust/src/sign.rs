@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
-use sl_dkls23::setup::sign::SetupMessage as SignSetupMessage;
+use sl_dkls23::setup::sign::SetupMessage as DsgSetupMessage;
 use sl_dkls23::sign::run as sign_run;
 use sl_dkls23::Relay;
 
@@ -29,21 +29,21 @@ type MessageHash = [u8; 32];
 // Right now it's just string vs an arbitrary byte array.
 // In the future might be extended to other types of messages.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
-pub enum SignMessageType {
+pub enum SignRequestType {
     String(String),
     Bytes(Vec<u8>),
 }
 
-impl SignMessageType {
+impl SignRequestType {
     // Make this explicit to *always* use SHA-256.
     // Otherwise, if Rust changes something we'll have incompatible sigs.
     pub fn get_hash(&self) -> MessageHash {
         let mut hasher = Sha256::new();
         match self {
-            SignMessageType::String(msg) => {
+            SignRequestType::String(msg) => {
                 hasher.update(msg.as_bytes());
             }
-            SignMessageType::Bytes(msg) => {
+            SignRequestType::Bytes(msg) => {
                 hasher.update(msg);
             }
         }
@@ -55,34 +55,34 @@ impl SignMessageType {
 
 #[uniffi::export]
 pub fn get_hash_string(msg: String) -> Vec<u8> {
-    let msg = SignMessageType::String(msg);
+    let msg = SignRequestType::String(msg);
     msg.get_hash().to_vec()
 }
 
 #[uniffi::export]
 pub fn get_hash_bytes(msg: Vec<u8>) -> Vec<u8> {
-    let msg = SignMessageType::Bytes(msg);
+    let msg = SignRequestType::Bytes(msg);
     msg.get_hash().to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SignRequestType {
-    Request(SignMessageType),
+pub enum SignSetupMessageType {
+    Request(SignRequestType),
     Join,
     Start,
     Cancel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Object)]
-pub struct SignRequest {
+pub struct SignSetupMessage {
     pub instance: InstanceId,
-    pub req_type: SignRequestType,
+    pub msg_type: SignSetupMessageType,
     pub hash: MessageHash,
     pub sigs: Vec<(NodeVerifyingKey, Signature)>,
 }
 
 // TODO: there has to be a better way than repeating this boilerplate for every message.
-impl TryFrom<&[u8]> for SignRequest {
+impl TryFrom<&[u8]> for SignSetupMessage {
     type Error = GeneralError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
@@ -90,7 +90,7 @@ impl TryFrom<&[u8]> for SignRequest {
     }
 }
 
-impl TryFrom<&str> for SignRequest {
+impl TryFrom<&str> for SignSetupMessage {
     type Error = GeneralError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -99,26 +99,26 @@ impl TryFrom<&str> for SignRequest {
 }
 
 #[uniffi::export]
-impl SignRequest {
+impl SignSetupMessage {
     #[uniffi::constructor]
-    pub fn for_message_bytes(
+    pub fn new_request_bytes(
         instance: &InstanceId,
         message: Vec<u8>,
         vk: &NodeVerifyingKey,
         sk: &NodeSecretKey,
     ) -> Self {
-        let msg = SignMessageType::Bytes(message.clone());
+        let msg = SignRequestType::Bytes(message.clone());
         Self::new_request(instance, msg, vk, sk)
     }
 
     #[uniffi::constructor]
-    pub fn for_message_string(
+    pub fn new_request_string(
         instance: &InstanceId,
         message: &str,
         vk: &NodeVerifyingKey,
         sk: &NodeSecretKey,
     ) -> Self {
-        let msg = SignMessageType::String(message.to_string());
+        let msg = SignRequestType::String(message.to_string());
         Self::new_request(instance, msg, vk, sk)
     }
 
@@ -145,9 +145,9 @@ impl SignRequest {
 
     // Only valid on a request.
     // This is extremely inefficient, but it's the only way in UniFFI.
-    pub fn get_message(&self) -> Option<SignMessageType> {
-        match &self.req_type {
-            SignRequestType::Request(msg) => Some(msg.clone()),
+    pub fn get_message(&self) -> Option<SignRequestType> {
+        match &self.msg_type {
+            SignSetupMessageType::Request(msg) => Some(msg.clone()),
             _ => None,
         }
     }
@@ -174,8 +174,8 @@ impl SignRequest {
     }
 
     pub fn check_sigs(&self) -> Result<(), GeneralError> {
-        match &self.req_type {
-            SignRequestType::Start => {
+        match &self.msg_type {
+            SignSetupMessageType::Start => {
                 if self.sigs.len() <= 1 {
                     return Err(GeneralError::InvalidInput(
                         "Invalid number of signatures".to_string(),
@@ -198,7 +198,7 @@ impl SignRequest {
         };
 
         // Check that the hash in the message matches the hash in the request.
-        if let SignRequestType::Request(msg) = &self.req_type {
+        if let SignSetupMessageType::Request(msg) = &self.msg_type {
             if msg.get_hash() != self.hash {
                 return Err(GeneralError::InvalidInput(
                     "Message hash does not match request hash".to_string(),
@@ -219,16 +219,16 @@ impl SignRequest {
         Ok(())
     }
 
-    pub fn equals(&self, other: &SignRequest) -> bool {
+    pub fn equals(&self, other: &SignSetupMessage) -> bool {
         self == other
     }
 }
 
-impl SignRequest {
-    fn empty(instance: &InstanceId, req: SignRequestType, hash: MessageHash) -> Self {
+impl SignSetupMessage {
+    fn empty(instance: &InstanceId, msg_type: SignSetupMessageType, hash: MessageHash) -> Self {
         Self {
             instance: *instance,
-            req_type: req,
+            msg_type,
             hash,
             sigs: vec![],
         }
@@ -236,7 +236,7 @@ impl SignRequest {
 
     fn new(
         instance: &InstanceId,
-        req: SignRequestType,
+        req: SignSetupMessageType,
         hash: MessageHash,
         vk: &NodeVerifyingKey,
         sk: &NodeSecretKey,
@@ -248,12 +248,12 @@ impl SignRequest {
 
     fn new_request(
         instance: &InstanceId,
-        msg: SignMessageType,
+        msg: SignRequestType,
         vk: &NodeVerifyingKey,
         sk: &NodeSecretKey,
     ) -> Self {
         let hash = msg.get_hash();
-        Self::new(instance, SignRequestType::Request(msg), hash, vk, sk)
+        Self::new(instance, SignSetupMessageType::Request(msg), hash, vk, sk)
     }
 
     pub fn req_hash(&self) -> MessageHash {
@@ -261,7 +261,7 @@ impl SignRequest {
         hasher.update(&self.instance);
         hasher.update(&self.hash);
         // Need to avoid replays with cancel.
-        if self.req_type == SignRequestType::Cancel {
+        if self.msg_type == SignSetupMessageType::Cancel {
             hasher.update(&[1]);
         } else {
             hasher.update(&[0]);
@@ -274,28 +274,40 @@ impl SignRequest {
         self.sigs.push((vk.clone(), sig));
     }
 
-    pub fn get_join_reply(&self, vk: &NodeVerifyingKey, sk: &NodeSecretKey) -> SignRequest {
-        Self::new(&self.instance, SignRequestType::Join, self.hash, vk, sk)
+    pub fn get_join_reply(&self, vk: &NodeVerifyingKey, sk: &NodeSecretKey) -> SignSetupMessage {
+        Self::new(
+            &self.instance,
+            SignSetupMessageType::Join,
+            self.hash,
+            vk,
+            sk,
+        )
     }
 
-    pub fn get_cancel_req(&self, vk: &NodeVerifyingKey, sk: &NodeSecretKey) -> SignRequest {
-        Self::new(&self.instance, SignRequestType::Cancel, self.hash, vk, sk)
+    pub fn get_cancel_req(&self, vk: &NodeVerifyingKey, sk: &NodeSecretKey) -> SignSetupMessage {
+        Self::new(
+            &self.instance,
+            SignSetupMessageType::Cancel,
+            self.hash,
+            vk,
+            sk,
+        )
     }
 
     // Assume we've added a bunch of joiners to the vector of party VKs.
     // Change the request type to Start and serialize to bytes.
     // (then swap back.)
     pub fn get_start_bytes(&mut self) -> Vec<u8> {
-        let mut start_req = SignRequestType::Start;
-        std::mem::swap(&mut self.req_type, &mut start_req);
+        let mut start_req = SignSetupMessageType::Start;
+        std::mem::swap(&mut self.msg_type, &mut start_req);
         let bytes = self.to_bytes();
-        std::mem::swap(&mut self.req_type, &mut start_req);
+        std::mem::swap(&mut self.msg_type, &mut start_req);
         bytes
     }
 
     // Check that a received request matches our own.
     // Return a result so callers can shortcut to error handling.
-    pub fn check_matches(&self, other: &SignRequest) -> Result<(), GeneralError> {
+    pub fn check_matches(&self, other: &SignSetupMessage) -> Result<(), GeneralError> {
         if other.instance != self.instance {
             return Err(GeneralError::InvalidInput("Instance mismatch".to_string()));
         }
@@ -309,8 +321,8 @@ impl SignRequest {
         // Should never be comparing two requests for the same instance.
         // If this happens it's almost certainly a bug.
         // Rather than assert, return an error so the message can be dropped.
-        match (&self.req_type, &other.req_type) {
-            (SignRequestType::Request(_), SignRequestType::Request(_)) => {
+        match (&self.msg_type, &other.msg_type) {
+            (SignSetupMessageType::Request(_), SignSetupMessageType::Request(_)) => {
                 return Err(GeneralError::InvalidInput(
                     "Cannot have two requests".to_string(),
                 ));
@@ -322,20 +334,19 @@ impl SignRequest {
     }
 
     // Add joiners to the request.
-    pub fn update(&mut self, reply_msg: SignRequest) -> Result<(), GeneralError> {
+    pub fn update(&mut self, reply_msg: SignSetupMessage) -> Result<(), GeneralError> {
         self.check_matches(&reply_msg)?;
         // TODO: should verify that VK is valid and in trusted list ?
 
         // This should always be just inserting one so we don't need to be too
         // worried about efficiency here.
         // Just make sure we don't have the same VK more than once.
-        let new_pairs = reply_msg
-            .sigs
-            .into_iter()
-            .filter(|(vk, _)| !self.sigs.iter().any(|(v, _)| v == vk))
-            .collect::<Vec<_>>();
-
-        self.sigs.extend(new_pairs);
+        for (vk, sig) in reply_msg.sigs {
+            if self.sigs.iter().any(|(v, _)| v == &vk) {
+                continue;
+            }
+            self.sigs.push((vk, sig));
+        }
         Ok(())
     }
 
@@ -358,15 +369,15 @@ use hex;
 // and relay. Made general for testing.
 pub async fn do_sign_relay<R: Relay>(
     ctx: Arc<DeviceLocalData>,
-    req: &SignRequest,
+    setup_msg: &SignSetupMessage,
     party_id: usize,
     relay: R,
 ) -> Result<Signature, GeneralError> {
-    let hash = req.hash;
-    let party_vk = req.sigs.iter().map(|(k, _)| k).collect::<Vec<_>>();
+    let hash = setup_msg.hash;
+    let party_vk = setup_msg.sigs.iter().map(|(k, _)| k).collect::<Vec<_>>();
     println!("doing sig for msg hash {:?}", hex::encode(hash));
-    let setup_msg = SignSetupMessage::new(
-        req.instance.into(),
+    let dsg_setup_msg = DsgSetupMessage::new(
+        setup_msg.instance.into(),
         &ctx.sk,
         party_id,
         party_vk,
@@ -375,33 +386,39 @@ pub async fn do_sign_relay<R: Relay>(
     .with_hash(hash)
     .with_ttl(Duration::from_secs(10));
     let mut rng = ChaCha20Rng::from_entropy();
-    Ok(Signature(sign_run(setup_msg, rng.gen(), relay).await?.0))
+    Ok(Signature(
+        sign_run(dsg_setup_msg, rng.gen(), relay).await?.0,
+    ))
 }
 
 // Callback on receiving a new signing request,
 // and when a request is cancelled before being accepted.
 #[uniffi::export(callback_interface)]
 pub trait SignRequestListener: Send + Sync {
-    fn receive_sign_request(&self, req: Arc<SignRequest>, dev: Option<Arc<DeviceInfo>>);
-    fn cancel_sign_request(&self, req: Arc<SignRequest>);
+    fn receive_sign_request(&self, req: Arc<SignSetupMessage>, dev: Option<Arc<DeviceInfo>>);
+    fn cancel_sign_request(&self, req: Arc<SignSetupMessage>);
 }
 
 // Callbacks for any signing request.
 #[uniffi::export(callback_interface)]
 pub trait SignResultListener: Send + Sync {
     // Devices involved in a signature changed.
-    fn sign_devices_changed(&self, req: Arc<SignRequest>, devices: Vec<Option<Arc<DeviceInfo>>>);
+    fn sign_devices_changed(
+        &self,
+        req: Arc<SignSetupMessage>,
+        devices: Vec<Option<Arc<DeviceInfo>>>,
+    );
     // The actual DSG protocol started.
-    fn sign_dsg_started(&self, req: Arc<SignRequest>);
+    fn sign_dsg_started(&self, req: Arc<SignSetupMessage>);
     // Signature request was cancelled by originator.
-    fn sign_cancelled(&self, req: Arc<SignRequest>);
+    fn sign_cancelled(&self, req: Arc<SignSetupMessage>);
     // Error occurred in DSG.
-    fn sign_error(&self, req: Arc<SignRequest>, error: GeneralError);
+    fn sign_error(&self, req: Arc<SignSetupMessage>, error: GeneralError);
     // DSG completed successfully.
-    fn sign_result(&self, req: Arc<SignRequest>, result: Arc<Signature>);
+    fn sign_result(&self, req: Arc<SignSetupMessage>, result: Arc<Signature>);
 }
 
-type RequestItem = (Arc<SignRequest>, Box<dyn SignResultListener>);
+type RequestItem = (Arc<SignSetupMessage>, Box<dyn SignResultListener>);
 
 /*****************************************************************************
  * DSG Node Representation.
@@ -411,7 +428,7 @@ type RequestItem = (Arc<SignRequest>, Box<dyn SignResultListener>);
 pub struct SignNode {
     ctx: Arc<DeviceLocalData>,
     outgoing_reqs: Mutex<HashMap<InstanceId, RequestItem>>,
-    incoming_reqs: Mutex<HashMap<InstanceId, Arc<SignRequest>>>,
+    incoming_reqs: Mutex<HashMap<InstanceId, Arc<SignSetupMessage>>>,
     accepted_reqs: Mutex<HashMap<InstanceId, RequestItem>>,
     request_listener: RwLock<Option<Box<dyn SignRequestListener>>>,
     net_if: Arc<dyn NetworkInterface>,
@@ -440,14 +457,14 @@ impl SignNode {
         &self,
         message: String,
         listener: Box<dyn SignResultListener>,
-    ) -> Result<Arc<SignRequest>, GeneralError> {
-        let req = self.new_request(SignMessageType::String(message), listener);
+    ) -> Result<Arc<SignSetupMessage>, GeneralError> {
+        let req = self.new_request(SignRequestType::String(message), listener);
         self.net_if.send(req.to_bytes()).await?;
         Ok(req)
     }
 
     // Cancel a request that we either sent out or accepted.
-    pub async fn cancel_request(&self, req: &SignRequest) -> Result<(), GeneralError> {
+    pub async fn cancel_request(&self, req: &SignSetupMessage) -> Result<(), GeneralError> {
         let og_req = if let Some((req, _)) =
             self.outgoing_reqs.lock().unwrap().remove(&req.instance)
         {
@@ -468,8 +485,8 @@ impl SignNode {
         &self,
         bytes: Vec<u8>,
         listener: Box<dyn SignResultListener>,
-    ) -> Result<Arc<SignRequest>, GeneralError> {
-        let req = self.new_request(SignMessageType::Bytes(bytes), listener);
+    ) -> Result<Arc<SignSetupMessage>, GeneralError> {
+        let req = self.new_request(SignRequestType::Bytes(bytes), listener);
         self.net_if.send(req.to_bytes()).await?;
         Ok(req)
     }
@@ -477,7 +494,7 @@ impl SignNode {
     // Accept a previously received signature request from another device.
     pub async fn accept_request(
         &self,
-        req: Arc<SignRequest>,
+        req: Arc<SignSetupMessage>,
         listener: Box<dyn SignResultListener>,
     ) -> Result<(), GeneralError> {
         self.accept_request_impl(req.clone(), listener)?;
@@ -486,7 +503,7 @@ impl SignNode {
         Ok(())
     }
 
-    pub fn reject_request(&self, req: &SignRequest) {
+    pub fn reject_request(&self, req: &SignSetupMessage) {
         // Just remove the request from the queue, no need to reply.
         self.incoming_reqs.lock().unwrap().remove(&req.instance);
     }
@@ -502,7 +519,7 @@ impl SignNode {
     // Received a signing request from another device over the network.
     // Inform the listener, which can then call back to accept it.
     // Don't do accept it otherwise it would block the thread.
-    pub fn receive_request(&self, req: SignRequest) {
+    pub fn receive_request(&self, req: SignSetupMessage) {
         // Signature already checked and must be exactly 1.
         // New request. First check whether to accept it.
 
@@ -524,16 +541,19 @@ impl SignNode {
     }
 
     // Received a join response, see if it's ours and if we're now ready.
-    pub fn receive_join(&self, req: SignRequest) -> Result<Option<RequestItem>, GeneralError> {
+    pub fn receive_join(
+        &self,
+        join_msg: SignSetupMessage,
+    ) -> Result<Option<RequestItem>, GeneralError> {
         // Check if we have an outgoing request for this instance.
         let mut guard = self.outgoing_reqs.lock().unwrap();
-        let Entry::Occupied(mut og_entry) = guard.entry(req.instance) else {
+        let Entry::Occupied(mut og_entry) = guard.entry(join_msg.instance) else {
             // Not for us.
             return Ok(None);
         };
         // Checks the hash and updates our party list.
         let (og_req, listener) = og_entry.get_mut();
-        Arc::make_mut(og_req).update(req)?;
+        Arc::make_mut(og_req).update(join_msg)?;
         // Alert the listener that the party list has changed.
         self.notify_devices_changed(listener.as_ref(), og_req.clone());
 
@@ -551,13 +571,13 @@ impl SignNode {
     // If so, check that the request matches and return our party id.
     pub fn receive_start(
         &self,
-        req: SignRequest,
+        start_msg: SignSetupMessage,
     ) -> Result<Option<(RequestItem, usize)>, GeneralError> {
         let mut guard = self.accepted_reqs.lock().unwrap();
-        let Entry::Occupied(og_entry) = guard.entry(req.instance) else {
+        let Entry::Occupied(og_entry) = guard.entry(start_msg.instance) else {
             // If we don't have an accepted request, check if we have a pending request.
             let mut guard = self.incoming_reqs.lock().unwrap();
-            if let Some(og_req) = guard.remove(&req.instance) {
+            if let Some(og_req) = guard.remove(&start_msg.instance) {
                 // Notify the UI that this pending request was cancelled.
                 let guard = self.request_listener.read().unwrap();
                 if let Some(listener) = guard.as_ref() {
@@ -570,45 +590,61 @@ impl SignNode {
         };
 
         let og_req = &og_entry.get().0;
-        og_req.check_matches(&req)?;
+        og_req.check_matches(&start_msg)?;
 
-        if req.sigs.len() < self.ctx.threshold() as usize {
+        if start_msg.sigs.len() < self.ctx.threshold() as usize {
             return Err(GeneralError::InvalidInput(
                 "Not enough signatures".to_string(),
             ));
         }
 
         // Assume that we've already checked sigs and that all VK are unique.
-        let Some(party_id) = req.sigs.iter().position(|(vk, _)| vk == self.ctx.my_vk()) else {
+        let Some(party_id) = start_msg
+            .sigs
+            .iter()
+            .position(|(vk, _)| vk == self.ctx.my_vk())
+        else {
             return Err(GeneralError::InvalidInput("Our VK not in list".to_string()));
         };
 
         // Remove the request from the accepted list.
         let (_, listener) = og_entry.remove();
         // Send back the new request because it has the start info.
-        Ok(Some(((req.into(), listener), party_id)))
+        Ok(Some(((start_msg.into(), listener), party_id)))
     }
 
-    pub fn receive_cancel(&self, req: &SignRequest) {
-        println!("receive_cancel: Instance ID: {}", hex::encode(req.instance));
+    pub fn receive_cancel(&self, cancel_msg: &SignSetupMessage) {
+        println!(
+            "receive_cancel: Instance ID: {}",
+            hex::encode(cancel_msg.instance)
+        );
         // Must have exactly one signature in a cancel message.
-        let vk = &req.sigs[0].0;
+        let vk = &cancel_msg.sigs[0].0;
         // Check if we have an outgoing request for this instance.
-        if let Some((og_req, listener)) = self.outgoing_reqs.lock().unwrap().get_mut(&req.instance)
+        if let Some((og_req, listener)) = self
+            .outgoing_reqs
+            .lock()
+            .unwrap()
+            .get_mut(&cancel_msg.instance)
         {
             println!("receive_cancel: checking outgoing_reqs");
             // Remove the participant VK from the list.
-            if og_req.check_matches(req).is_ok() {
+            if og_req.check_matches(cancel_msg).is_ok() {
                 Arc::make_mut(og_req).remove_vk(vk);
                 self.notify_devices_changed(listener.as_ref(), og_req.clone());
             }
         }
         // Check if we have an accepted request for this instance.
-        if let Entry::Occupied(og_entry) = self.accepted_reqs.lock().unwrap().entry(req.instance) {
+        if let Entry::Occupied(og_entry) = self
+            .accepted_reqs
+            .lock()
+            .unwrap()
+            .entry(cancel_msg.instance)
+        {
             println!("receive_cancel: found in accepted_reqs");
             let og_req = &og_entry.get().0;
             // The original request would only have had one VK so check that they match.
-            if og_req.check_matches(req).is_ok() {
+            if og_req.check_matches(cancel_msg).is_ok() {
                 if og_req.has_vk(vk) {
                     println!(
                         "receive_cancel: has_vk matched, removing from accepted_reqs and firing"
@@ -630,9 +666,14 @@ impl SignNode {
                 println!("receive_cancel: check_matches FAILED!");
             }
         };
-        if let Entry::Occupied(og_entry) = self.incoming_reqs.lock().unwrap().entry(req.instance) {
+        if let Entry::Occupied(og_entry) = self
+            .incoming_reqs
+            .lock()
+            .unwrap()
+            .entry(cancel_msg.instance)
+        {
             println!("receive_cancel: found in incoming_reqs");
-            if og_entry.get().check_matches(req).is_ok() && og_entry.get().has_vk(vk) {
+            if og_entry.get().check_matches(cancel_msg).is_ok() && og_entry.get().has_vk(vk) {
                 let og_req = og_entry.remove();
 
                 // Notify the UI that this pending request was cancelled.
@@ -647,44 +688,44 @@ impl SignNode {
     // Get the next signing request from the network interface.
     pub async fn process_next_msg(&self) -> Result<(), GeneralError> {
         let msg_bytes = self.net_if.receive().await?;
-        let req = SignRequest::try_from(msg_bytes.as_slice())?;
-        req.check_sigs()?;
+        let setup_msg = SignSetupMessage::try_from(msg_bytes.as_slice())?;
+        setup_msg.check_sigs()?;
 
-        let start_op = match &req.req_type {
-            SignRequestType::Request(_) => {
-                self.receive_request(req);
+        let start_op = match &setup_msg.msg_type {
+            SignSetupMessageType::Request(_) => {
+                self.receive_request(setup_msg);
                 None
             }
-            SignRequestType::Join => {
-                let start = self.receive_join(req)?;
-                if let Some((mut start_req, listener)) = start {
-                    let start_bytes = Arc::make_mut(&mut start_req).get_start_bytes();
+            SignSetupMessageType::Join => {
+                let start = self.receive_join(setup_msg)?;
+                if let Some((mut orig_req, listener)) = start {
+                    let start_bytes = Arc::make_mut(&mut orig_req).get_start_bytes();
                     self.net_if.send(start_bytes).await?;
-                    Some(((start_req, listener), 0))
+                    Some(((orig_req, listener), 0))
                 } else {
                     None
                 }
             }
-            SignRequestType::Start => self.receive_start(req)?,
-            SignRequestType::Cancel => {
-                self.receive_cancel(&req);
+            SignSetupMessageType::Start => self.receive_start(setup_msg)?,
+            SignSetupMessageType::Cancel => {
+                self.receive_cancel(&setup_msg);
                 None
             }
         };
 
         // If we're clear to start, notify the listener and do it.
-        if let Some(((start_req, listener), party_id)) = start_op {
-            listener.sign_dsg_started(start_req.clone());
+        if let Some(((start_setup, listener), party_id)) = start_op {
+            listener.sign_dsg_started(start_setup.clone());
             let res = do_sign_relay(
                 self.ctx.clone(),
-                &start_req,
+                &start_setup,
                 party_id,
                 create_network_relay(self.net_if.clone()),
             )
             .await;
             match res {
-                Ok(sig) => listener.sign_result(start_req, Arc::new(sig)),
-                Err(e) => listener.sign_error(start_req, e),
+                Ok(sig) => listener.sign_result(start_setup, Arc::new(sig)),
+                Err(e) => listener.sign_error(start_setup, e),
             }
         }
         Ok(())
@@ -693,32 +734,32 @@ impl SignNode {
     // Internal helper to create a new signing request and add it to the queue.
     fn new_request(
         &self,
-        msg: SignMessageType,
+        req_type: SignRequestType,
         listener: Box<dyn SignResultListener>,
-    ) -> Arc<SignRequest> {
+    ) -> Arc<SignSetupMessage> {
         let instance = InstanceId::from_entropy();
-        let req = Arc::new(SignRequest::new_request(
+        let msg = Arc::new(SignSetupMessage::new_request(
             &instance,
-            msg,
+            req_type,
             self.ctx.my_vk(),
             &self.ctx.sk,
         ));
         // Convenience: tell the listener about ourselves.
-        self.notify_devices_changed(listener.as_ref(), req.clone());
+        self.notify_devices_changed(listener.as_ref(), msg.clone());
         {
             self.outgoing_reqs
                 .lock()
                 .unwrap()
-                .insert(instance, (req.clone(), listener));
+                .insert(instance, (msg.clone(), listener));
         }
-        req
+        msg
     }
 
     // Internal sync function to ensure we never leak mutexes.
 
     fn accept_request_impl(
         &self,
-        req: Arc<SignRequest>,
+        req: Arc<SignSetupMessage>,
         listener: Box<dyn SignResultListener>,
     ) -> Result<(), GeneralError> {
         let og_req = self.incoming_reqs.lock().unwrap().remove(&req.instance);
@@ -737,13 +778,17 @@ impl SignNode {
     }
 
     // Internal helper to notify listeners of device changes.
-    fn notify_devices_changed(&self, listener: &dyn SignResultListener, req: Arc<SignRequest>) {
-        let devices = req
+    fn notify_devices_changed(
+        &self,
+        listener: &dyn SignResultListener,
+        setup: Arc<SignSetupMessage>,
+    ) {
+        let devices = setup
             .sigs
             .iter()
             .map(|(vk, _)| find_device_by_vk(&self.ctx.devices, vk))
             .collect::<Vec<_>>();
-        listener.sign_devices_changed(req.clone(), devices);
+        listener.sign_devices_changed(setup.clone(), devices);
     }
 }
 
@@ -756,7 +801,7 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     struct SharedState {
-        received_req: Mutex<Option<Arc<SignRequest>>>,
+        received_req: Mutex<Option<Arc<SignSetupMessage>>>,
         received_dev: Mutex<Option<Arc<DeviceInfo>>>,
         received_sig: Mutex<Option<Arc<Signature>>>,
         received_devices: Mutex<Vec<Option<Arc<DeviceInfo>>>>,
@@ -794,12 +839,12 @@ mod tests {
     }
 
     impl SignRequestListener for SharedListener {
-        fn receive_sign_request(&self, req: Arc<SignRequest>, dev: Option<Arc<DeviceInfo>>) {
+        fn receive_sign_request(&self, req: Arc<SignSetupMessage>, dev: Option<Arc<DeviceInfo>>) {
             *self.state.received_req.lock().unwrap() = Some(req);
             *self.state.received_dev.lock().unwrap() = dev;
             self.state.accept_signal.store(true, Ordering::SeqCst);
         }
-        fn cancel_sign_request(&self, _req: Arc<SignRequest>) {
+        fn cancel_sign_request(&self, _req: Arc<SignSetupMessage>) {
             self.state.cancelled_signal.store(true, Ordering::SeqCst);
         }
     }
@@ -807,7 +852,7 @@ mod tests {
     impl SignResultListener for SharedListener {
         fn sign_devices_changed(
             &self,
-            _req: Arc<SignRequest>,
+            _req: Arc<SignSetupMessage>,
             devices: Vec<Option<Arc<DeviceInfo>>>,
         ) {
             *self.state.received_devices.lock().unwrap() = devices;
@@ -815,17 +860,17 @@ mod tests {
                 .devices_changed_signal
                 .store(true, Ordering::SeqCst);
         }
-        fn sign_dsg_started(&self, _req: Arc<SignRequest>) {
+        fn sign_dsg_started(&self, _req: Arc<SignSetupMessage>) {
             self.state.started_signal.store(true, Ordering::SeqCst);
         }
-        fn sign_result(&self, _req: Arc<SignRequest>, result: Arc<Signature>) {
+        fn sign_result(&self, _req: Arc<SignSetupMessage>, result: Arc<Signature>) {
             *self.state.received_sig.lock().unwrap() = Some(result);
             self.state.sig_signal.store(true, Ordering::SeqCst);
         }
-        fn sign_cancelled(&self, _req: Arc<SignRequest>) {
+        fn sign_cancelled(&self, _req: Arc<SignSetupMessage>) {
             self.state.cancelled_signal.store(true, Ordering::SeqCst);
         }
-        fn sign_error(&self, _req: Arc<SignRequest>, _error: GeneralError) {}
+        fn sign_error(&self, _req: Arc<SignSetupMessage>, _error: GeneralError) {}
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1035,13 +1080,13 @@ mod tests {
             panic!("Sniffer timed out waiting for request");
         }
         let sent_bytes = sent_bytes.unwrap().unwrap();
-        let og_req = SignRequest::try_from(sent_bytes.as_slice()).unwrap();
+        let og_req = SignSetupMessage::try_from(sent_bytes.as_slice()).unwrap();
 
         let mut hash = og_req.hash;
         hash[0] = hash[0].wrapping_add(1);
-        let bad_req = SignRequest::new(
+        let bad_req = SignSetupMessage::new(
             &og_req.instance,
-            SignRequestType::Join,
+            SignSetupMessageType::Join,
             hash,
             contexts[1].my_vk(),
             &contexts[1].sk,
@@ -1073,9 +1118,9 @@ mod tests {
         let instance = InstanceId::from_entropy();
         let msg_hash = [0u8; 32];
 
-        let req = SignRequest::new(
+        let req = SignSetupMessage::new(
             &instance,
-            SignRequestType::Join,
+            SignSetupMessageType::Join,
             msg_hash,
             contexts[1].my_vk(),
             &contexts[1].sk,
@@ -1099,7 +1144,8 @@ mod tests {
         let instance = InstanceId::from_entropy();
 
         // Create start request (needs > 1 sigs for Start type check to pass)
-        let mut start_req = SignRequest::empty(&instance, SignRequestType::Start, msg_hash);
+        let mut start_req =
+            SignSetupMessage::empty(&instance, SignSetupMessageType::Start, msg_hash);
         start_req.sign(contexts[0].my_vk(), &contexts[0].sk);
         start_req.sign(contexts[1].my_vk(), &contexts[1].sk);
 
@@ -1124,7 +1170,7 @@ mod tests {
 
         // Inject an accepted request so receive_start proceeds to check signatures
         let req_bytes = vec![1, 2, 3];
-        let req = Arc::new(SignRequest::for_message_bytes(
+        let req = Arc::new(SignSetupMessage::new_request_bytes(
             &instance,
             req_bytes,
             contexts[0].my_vk(),
@@ -1144,7 +1190,8 @@ mod tests {
             .unwrap();
 
         // Now create Start request with only 2 signatures (threshold 3)
-        let mut start_req = SignRequest::empty(&instance, SignRequestType::Start, req.hash);
+        let mut start_req =
+            SignSetupMessage::empty(&instance, SignSetupMessageType::Start, req.hash);
         start_req.sign(contexts[0].my_vk(), &contexts[0].sk);
         start_req.sign(contexts[1].my_vk(), &contexts[1].sk);
 
@@ -1171,8 +1218,12 @@ mod tests {
         // 1. Receive Request from Node 1
         let instance = InstanceId::from_entropy();
         let msg = "test_sim_req_then_start_then_accept";
-        let req =
-            SignRequest::for_message_string(&instance, &msg, contexts[1].my_vk(), &contexts[1].sk);
+        let req = SignSetupMessage::new_request_string(
+            &instance,
+            &msg,
+            contexts[1].my_vk(),
+            &contexts[1].sk,
+        );
 
         let sniffer = bridge.connect();
         sniffer.send(req.to_bytes()).await.unwrap();
@@ -1190,7 +1241,8 @@ mod tests {
 
         // 2. Receive Start message (from Node 1)
         // Hash of the message to sign
-        let mut start_req = SignRequest::empty(&instance, SignRequestType::Start, req.hash);
+        let mut start_req =
+            SignSetupMessage::empty(&instance, SignSetupMessageType::Start, req.hash);
         start_req.sign(contexts[0].my_vk(), &contexts[0].sk);
         start_req.sign(contexts[1].my_vk(), &contexts[1].sk);
         sniffer.send(start_req.to_bytes()).await.unwrap();
@@ -1220,7 +1272,7 @@ mod tests {
         let node1 = Arc::new(SignNode::new(contexts[0].clone(), bridge.connect()));
 
         let instance = InstanceId::from_entropy();
-        let req = SignRequest::for_message_string(
+        let req = SignSetupMessage::new_request_string(
             &instance,
             "test",
             contexts[0].my_vk(),
@@ -1246,7 +1298,7 @@ mod tests {
 
         // Receive valid request
         let instance = InstanceId::from_entropy();
-        let req = SignRequest::for_message_string(
+        let req = SignSetupMessage::new_request_string(
             &instance,
             "test_sim_accept_wrong_hash",
             contexts[0].my_vk(),
@@ -1263,7 +1315,7 @@ mod tests {
         }
 
         // Create a different request with same instance but DIFFERENT content
-        let bad_req = SignRequest::for_message_string(
+        let bad_req = SignSetupMessage::new_request_string(
             &instance,
             "modified content",
             contexts[0].my_vk(),

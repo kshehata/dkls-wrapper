@@ -7,14 +7,14 @@ import NIO
 
 final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked Sendable {
     private let localData: DeviceLocalData
-    private var pendingRequests: [SignRequest] = []
+    private var pendingRequests: [SignSetupMessage] = []
     private let lock = NSLock()
 
     init(localData: DeviceLocalData) {
         self.localData = localData
     }
 
-    func receiveSignRequest(req: SignRequest, dev: DeviceInfo?) {
+    func receiveSignRequest(req: SignSetupMessage, dev: DeviceInfo?) {
         print("\n*** NEW SIGN REQUEST ***")
 
         lock.lock()
@@ -44,7 +44,7 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         fflush(stdout)
     }
 
-    func signResult(req: SignRequest, result: Signature) {
+    func signResult(req: SignSetupMessage, result: Signature) {
         print("\n*** SIGNATURE GENERATED ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Signature: \(hexString(result.toBytes()))")
@@ -57,7 +57,7 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         fflush(stdout)
     }
 
-    func signError(req: SignRequest, error: GeneralError) {
+    func signError(req: SignSetupMessage, error: GeneralError) {
         print("\n*** SIGNING ERROR ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Error: \(error)")
@@ -70,14 +70,14 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         fflush(stdout)
     }
 
-    func cancelSignRequest(req: SignRequest) {
+    func cancelSignRequest(req: SignSetupMessage) {
         print("\n*** SIGN REQUEST CANCELLED ***")
         lock.lock()
         pendingRequests.removeAll { $0.instance() == req.instance() }
         lock.unlock()
     }
 
-    func signDevicesChanged(req: SignRequest, devices: [DeviceInfo?]) {
+    func signDevicesChanged(req: SignSetupMessage, devices: [DeviceInfo?]) {
         print("\n*** SIGNING DEVICES CHANGED ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
         print("Devices:")
@@ -90,12 +90,12 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         }
     }
 
-    func signDsgStarted(req: SignRequest) {
+    func signDsgStarted(req: SignSetupMessage) {
         print("\n*** SIGNING DSG STARTED ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
     }
 
-    func signCancelled(req: SignRequest) {
+    func signCancelled(req: SignSetupMessage) {
         print("\n*** SIGNING CANCELLED BY ORIGINATOR ***")
         print("Instance ID: \(hexString(req.instance().toBytes()))")
 
@@ -107,7 +107,7 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         fflush(stdout)
     }
 
-    func addPendingRequest(req: SignRequest) {
+    func addPendingRequest(req: SignSetupMessage) {
         lock.lock()
         defer { lock.unlock() }
         pendingRequests.append(req)
@@ -119,7 +119,7 @@ final class ConsoleListener: SignRequestListener, SignResultListener, @unchecked
         pendingRequests.removeAll { $0.instance().toBytes() == instance }
     }
 
-    func getPendingRequest(index: Int) -> SignRequest? {
+    func getPendingRequest(index: Int) -> SignSetupMessage? {
         lock.lock()
         defer { lock.unlock() }
         if index >= 0 && index < pendingRequests.count {

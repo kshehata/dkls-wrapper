@@ -198,9 +198,9 @@ extension QrData: Equatable, Hashable, Identifiable, Codable {
     }
 }
 
-// MARK: - SignRequest
-extension SignRequest: Equatable, Hashable, Identifiable, Codable {
-    public static func == (lhs: SignRequest, rhs: SignRequest) -> Bool {
+// MARK: - SignSetupMessage
+extension SignSetupMessage: Equatable, Hashable, Identifiable, Codable {
+    public static func == (lhs: SignSetupMessage, rhs: SignSetupMessage) -> Bool {
         return lhs.equals(other: rhs)
     }
 

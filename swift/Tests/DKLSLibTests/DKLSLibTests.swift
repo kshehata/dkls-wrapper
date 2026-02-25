@@ -186,14 +186,14 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
 
     // Helper listener to capture events
     class AsyncSignListener: SignRequestListener, SignResultListener {
-        var reqContinuation: AsyncStream<SignRequest>.Continuation?
+        var reqContinuation: AsyncStream<SignSetupMessage>.Continuation?
         var resContinuation: AsyncStream<Signature>.Continuation?
 
-        let reqStream: AsyncStream<SignRequest>
+        let reqStream: AsyncStream<SignSetupMessage>
         let resStream: AsyncStream<Signature>
 
         init() {
-            var reqCont: AsyncStream<SignRequest>.Continuation!
+            var reqCont: AsyncStream<SignSetupMessage>.Continuation!
             self.reqStream = AsyncStream { reqCont = $0 }
             self.reqContinuation = reqCont
 
@@ -202,24 +202,24 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             self.resContinuation = resCont
         }
 
-        func receiveSignRequest(req: SignRequest, dev: DeviceInfo?) {
+        func receiveSignSetupMessage(req: SignSetupMessage, dev: DeviceInfo?) {
             reqContinuation?.yield(req)
         }
 
-        func cancelSignRequest(req: SignRequest) {}
-        func signDevicesChanged(req: SignRequest, devices: [DeviceInfo?]) {}
-        func signDsgStarted(req: SignRequest) {}
-        func signCancelled(req: SignRequest) {}
+        func cancelSignSetupMessage(req: SignSetupMessage) {}
+        func signDevicesChanged(req: SignSetupMessage, devices: [DeviceInfo?]) {}
+        func signDsgStarted(req: SignSetupMessage) {}
+        func signCancelled(req: SignSetupMessage) {}
 
-        func signResult(req: SignRequest, result: Signature) {
+        func signResult(req: SignSetupMessage, result: Signature) {
             resContinuation?.yield(result)
         }
 
-        func signError(req: SignRequest, error: GeneralError) {
+        func signError(req: SignSetupMessage, error: GeneralError) {
             // print("Sign error: \(error)")
         }
 
-        func nextRequest() async -> SignRequest? {
+        func nextRequest() async -> SignSetupMessage? {
             var iter = reqStream.makeAsyncIterator()
             return await iter.next()
         }

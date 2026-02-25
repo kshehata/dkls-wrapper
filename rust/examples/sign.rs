@@ -1,5 +1,5 @@
 use clap::Parser;
-use dkls::sign::{SignMessageType, SignNode, SignRequest, SignRequestListener};
+use dkls::sign::{SignNode, SignRequestListener, SignRequestType, SignSetupMessage};
 use dkls::types::DeviceLocalData;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -27,7 +27,7 @@ struct Args {
 struct AppState {
     // Store pending requests in a Vec to access by index.
     // Index 0 = Request #1
-    pending_requests: Mutex<Vec<Arc<SignRequest>>>,
+    pending_requests: Mutex<Vec<Arc<SignSetupMessage>>>,
 }
 
 struct ConsoleListener {
@@ -36,13 +36,10 @@ struct ConsoleListener {
     tx: mpsc::Sender<()>, // Signal main loop to print prompt again or something?
                           // Actually just printing to stdout is enough.
 }
-
-use dkls::types::find_device_by_vk;
-
 impl SignRequestListener for ConsoleListener {
     fn receive_sign_request(
         &self,
-        req: Arc<SignRequest>,
+        req: Arc<SignSetupMessage>,
         dev: Option<Arc<dkls::types::DeviceInfo>>,
     ) {
         println!("\n*** NEW SIGN REQUEST ***");
@@ -54,8 +51,8 @@ impl SignRequestListener for ConsoleListener {
 
         if let Some(msg) = req.get_message() {
             match msg {
-                SignMessageType::String(s) => println!("Message: {}", s),
-                SignMessageType::Bytes(b) => println!("Bytes: {:?}", b),
+                SignRequestType::String(s) => println!("Message: {}", s),
+                SignRequestType::Bytes(b) => println!("Bytes: {:?}", b),
             }
         }
 
@@ -84,7 +81,7 @@ impl SignRequestListener for ConsoleListener {
         let _ = self.tx.try_send(());
     }
 
-    fn cancel_sign_request(&self, req: Arc<SignRequest>) {
+    fn cancel_sign_request(&self, req: Arc<SignSetupMessage>) {
         println!("\n*** SIGN REQUEST CANCELLED ***");
         let mut lock = self.state.pending_requests.lock().unwrap();
         lock.retain(|r| r.instance != req.instance);
@@ -99,7 +96,7 @@ use dkls::types::Signature;
 impl SignResultListener for ConsoleListener {
     fn sign_devices_changed(
         &self,
-        req: Arc<SignRequest>,
+        req: Arc<SignSetupMessage>,
         devices: Vec<Option<Arc<dkls::types::DeviceInfo>>>,
     ) {
         println!("\n*** SIGNING DEVICES CHANGED ***");
@@ -113,18 +110,18 @@ impl SignResultListener for ConsoleListener {
             }
         }
     }
-    fn sign_dsg_started(&self, req: Arc<SignRequest>) {
+    fn sign_dsg_started(&self, req: Arc<SignSetupMessage>) {
         println!("\n*** SIGNING DSG STARTED ***");
         println!("Instance ID: {}", hex::encode(req.instance));
     }
-    fn sign_cancelled(&self, req: Arc<SignRequest>) {
+    fn sign_cancelled(&self, req: Arc<SignSetupMessage>) {
         println!("\n*** SIGNING CANCELLED BY ORIGINATOR ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         let mut lock = self.state.pending_requests.lock().unwrap();
         lock.retain(|r| r.instance != req.instance);
     }
 
-    fn sign_result(&self, req: Arc<SignRequest>, result: Arc<Signature>) {
+    fn sign_result(&self, req: Arc<SignSetupMessage>, result: Arc<Signature>) {
         println!("\n*** SIGNATURE GENERATED ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         println!("Signature: {}", hex::encode(result.to_bytes()));
@@ -138,7 +135,7 @@ impl SignResultListener for ConsoleListener {
         let _ = self.tx.try_send(());
     }
 
-    fn sign_error(&self, req: Arc<SignRequest>, error: GeneralError) {
+    fn sign_error(&self, req: Arc<SignSetupMessage>, error: GeneralError) {
         println!("\n*** SIGNING ERROR ***");
         println!("Instance ID: {}", hex::encode(req.instance));
         println!("Error: {:?}", error);
@@ -338,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             for (i, req) in lock.iter().enumerate() {
                                 print!("[{}] ", i);
-                                if let Some(SignMessageType::String(msg)) = req.get_message() {
+                                if let Some(SignRequestType::String(msg)) = req.get_message() {
                                     print!("{}", msg);
                                 } else {
                                     print!("<binary data>");
