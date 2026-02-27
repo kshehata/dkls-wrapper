@@ -57,6 +57,68 @@ Code generation complete, formatting with ktlint (use --no-format to disable)
 Kotlin bindings: kotlin/src/main/kotlin
 Native library:  kotlin/src/main/resources/native
 ```
+### 3. Setting up the MQTT Broker
+This project’s Kotlin CLIs expect an MQTT broker reachable at `host:port` (default `localhost:1883`).
+#### For this segment, we'll look into local Terminal setup ONLY
+- Go-to [Eclipse Mosquitto](https://mosquitto.org/) for Windows download.
+- Run the `.exe` file, and install accordingly.
+- After installation finishes, the Broker *SHOULD* be accessible.
+- On Windows, you can check if the port is opened according with the following:
+```
+tnc localhost -Port 1883
+```
 
-### 3. Running the Kotlin Program using Gradle
-- Run `gradlew run` within your CLI, located within the `kotlin/`, to run the application.
+### 4. Running the Kotlin Programs (CLI) using Gradle
+#### What you need
+- Access to an [MQTT broker](https://mosquitto.org/) (default `localhost:1883`) mentioned in Step 3.
+#### How to use
+- Go into the Kotlin CLI directory (the folder that contains `build.gradle.kts`).
+```
+cd kotlin
+```
+- Run the DKG key generation CLI with Gradle:
+```
+./gradlew keygen
+```
+- Enter the necessary information when prompted.
+- To start a new DKG (the first device):
+   - Leave the QR data input empty.
+   - The program will print “My QR” as a Base64 string. Copy this QR string and share it with the other devices that should join the same DKG session.
+- To join an existing DKG (another device):
+   - Paste the Base64 “My QR” string from the first device into the QR data prompt.
+   - The program will automatically use the instance ID from the QR data to derive the correct MQTT topics for setup/protocol messaging.
+- While the program is running:
+   - Paste additional devices’ QR data (Base64) into the terminal to mark them as "Verified" in the setup.
+   - When the node reaches the `READY` state, press Enter on an empty line to start the DKG.
+- After the DKG completes:
+   - The program writes the device’s local data to the output filename you chose (default `keyshare_<name>`).
+
+### 5. Running the Signing Program using Gradle
+#### What you need
+- A keyshare/ device local data file produced by the DKG CLI (CLIKeyGen), since CLISign loads `DeviceLocalData` from that file at startup.
+- Access to an [MQTT broker](https://mosquitto.org/) (default `localhost:1883`) mentioned in Step 3.
+#### How to get started
+- Go into/Remain in the Kotlin CLI directory (the folder that contains `build.gradle.kts`).
+```
+cd kotlin
+```
+- Run the signing CLI with Gradle:
+```
+./gradlew sign
+```
+- When the program starts, it asks for:
+  - Keyshare filename (required).
+  - Message to sign (optional; empty = listener mode).
+  - Skip confirmation for signing requests (enter `y` to auto-approve requests - **Highly recommended for ease of use**).
+  - MQTT host (defaults to `localhost`).
+  - MQTT port (defaults to `1883`).
+
+#### Using the interactive commands
+- After startup, CLISign enters a simple command loop.
+- Available Commands:
+  - `s <message>`: Request a signature for a string message (outgoing request).
+  - `a <index>`: Approve a pending incoming request by index.
+  - `c <index>`: Cancel a request by index.
+  - `l`: List pending incoming requests.
+  - `v <message> <sigHex>`: Verify a signature against a string message (Caps Sensitive) via group verifying key from your keyshare.
+  - `x`: Exit.
