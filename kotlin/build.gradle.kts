@@ -34,14 +34,32 @@ tasks.withType<KotlinCompile>().configureEach {
 }
 
 application {
-    mainClass.set("app.MainKt")  // Such that `app/Main.kt` contains `main()`
 }
 
 val nativeDir = layout.projectDirectory.dir("src/main/resources/native").asFile.absolutePath
 
-tasks.named<JavaExec>("run") {
+fun JavaExec.configureCli(mainKt: String) {
+    group = "application"
+    mainClass.set(mainKt)
+    classpath = sourceSets["main"].runtimeClasspath
+
+    // Needed for System.loadLibrary("dkls") in your Native.loadOrThrow()
     systemProperty("java.library.path", nativeDir)
-    workingDir = project.projectDir  // Make runs consistent even if launched from elsewhere
+
+    // Make readLine()/console input work like your Swift CLI
+    standardInput = System.`in`
+
+    workingDir = project.projectDir
+}
+
+tasks.register<JavaExec>("keygen") {
+    description = "Run DKG (key generation) CLI"
+    configureCli("app.CLIKeyGen.MainKt")
+}
+
+tasks.register<JavaExec>("sign") {
+    description = "Run signing CLI"
+    configureCli("app.CLISign.MainKt")
 }
 
 tasks.test {
