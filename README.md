@@ -1,8 +1,19 @@
 # DKLS Wrapper Library
 
-This library provides a cross-platform wrapper for the [DKLS23](https://eprint.iacr.org/2023/765.pdf) threshold signature scheme, enabling distributed signature generation (DSG) for ECDSA in a $t$-of-$n$ setup. It currently relies on the [Silence Labs](https://silencelaboratories.com/) [DKLS23](https://github.com/silence-laboratories/dkls23) Rust Crate. The library is written in Rust and provides bindings via [UniFFI](https://github.com/mozilla/uniffi-rs) for Swift and Kotlin, as well as any other language supported by UniFFI (e.g. JS/WebASM should be trivial).
+This library provides a cross-platform wrapper for the
+[DKLS23](https://eprint.iacr.org/2023/765.pdf) threshold signature scheme,
+enabling distributed signature generation (DSG) for ECDSA in a $t$-of-$n$ setup.
+It currently relies on the [Silence Labs](https://silencelaboratories.com/)
+[DKLS23](https://github.com/silence-laboratories/dkls23) Rust Crate. The library
+is written in Rust and provides bindings via
+[UniFFI](https://github.com/mozilla/uniffi-rs) for Swift and Kotlin, as well as
+any other language supported by UniFFI (e.g. JS/WebASM should be trivial).
 
-The wrapper is intended to be used by mobile applications (e.g. iOS and Android) to perform distributed key generation and threshold signing. As such it is opinionated about how nodes are managed and is *not* intended for general cryptographic use. The idea is that there is user overseeing and approving action, although policies can be implemented at a higher layer.
+The wrapper is intended to be used by mobile applications (e.g. iOS and Android)
+to perform distributed key generation and threshold signing. As such it is
+opinionated about how nodes are managed and is *not* intended for general
+cryptographic use. The idea is that there is user overseeing and approving
+action, although policies can be implemented at a higher layer.
 
 ## Overview
 
@@ -24,40 +35,120 @@ It is designed to be agnostic to the network transport layer. You must provide a
 
 ### Prerequisites
 
-- **Rust**: Latest stable toolchain.
-- **Swift/iOS**: Xcode (for macOS/iOS development).
-- **Kotlin/Android**: JDK and Android SDK (for Android development).
-- **UniFFI**: Used for generating bindings.
+- **Rust**: Rust 2021 Edition (last tested with Cargo 1.91.1)
+- **UniFFI**: Used for generating bindings to languages other than Rust (see
+  [Cargo.toml](Cargo.toml) for version).
+- **Swift/iOS**:
+    - Swift / Xcode
+    - [cargo-swift](https://github.com/antoniusnaumann/cargo-swift) 0.10.0
+    - Rust targets: `rustup target install aarch64-apple-ios-sim aarch64-apple-ios x86_64-apple-ios`
+- **Kotlin/Android**:
+    - JDK and Android SDK (for Android development).
+    - `cargo-ndk` (TODO)
+    - Rust targets: `rustup target install armv7-linux-androideabi
+      aarch64-linux-android i686-linux-android 86_64-linux-android`
 
 ### Structure
 
-- `rust/`: Core Rust implementation.
-    - `src/`: core Rust source code.
-        - `types.rs` and `error.rs`: Common types and error definitions used across the library.
-        - `net.rs`: Network interface definitions.
-        - `dkg.rs`: DKG logic and state machine.
-        - `sign.rs`: Signing logic.
-        - `test.rs`: Helpers for implementing tests.
-    - `examples/`: Example code for using the library in a Rust CLI.
-- `swift/`: Swift package and examples.
-    - `Sources/DKLSLib`: Generated Swift code ends up here and should not be modified. Additional Swift-only code can also live here.
-    - `Tests/DKLSLibTests`: Test code for the Swift bindings.
-    - `Sources/CLICore`: Common CLI code for Swift examples, e.g. Swift MQTT interfaces.
-    - `Sources/CLIKeyGen`: Example CLI for DKG.
-    - `Sources/CLISign`: Example CLI for Signing.
-- `kotlin/`: Kotlin/Android bindings.
+- `docs/`: Look here first for any additional documentation!
+- `src/`: core Rust source code.
+    - `types.rs` and `error.rs`: Common types and error definitions used across the library.
+    - `net.rs`: Network interface definitions.
+    - `dkg.rs`: DKG logic and state machine.
+    - `sign.rs`: Signing logic.
+    - `test.rs`: Helpers for implementing tests.
+- `swift/`: SwiftPM project file, extensions to generated code, tests. Cannot be
+  built directly, must be copied into the generated Swift package.
+- `examples/`
+    - `rust/`: Example CLI in Rust for both DKG and signature generation.
+    - `swift/`: Example CLI in Swift for both DKG and signature generation.
+    - `kotlin/`: Example CLI in Kotlin for both DKG and signature generation.
+- `build-swift.sh`: Script to generate Swift bindings.
+- `build-kotlin.sh`: Script to generate Kotlin bindings.
 
-### Building the Bindings
+## Examples
 
-Scripts are provided to build the platform-specific bindings:
+The examples demonstrate how to use the library over an MQTT connection for both
+DKG and signature generation. Building the example code is generally done by
+first generating the bindings for the given platform/language, and then building
+the example itself. The examples should be cross-compatible, that is you should
+be able to run a DKG with devices running different platforms. To use the
+examples, you'll need to run an MQTT broker. We suggest
+[Mosquitto](https://mosquitto.org/), but you can use any MQTT compatible broker.
 
-- **Swift**: `./build-swift.sh`
-- **Kotlin**: `./build-kotlin.sh`
+With the broker running, first use DKG to generate a secret-shared key before
+running the signature generation tools. The first device sets the configuration,
+while subsequent devices are given a Base45-encoded string (to represent a QR
+code) which includes setup information.
 
-These scripts generate the necessary `.swift` or `.kt` files and C-compatible binaries.
+### Common DKG Parameters & Usage
+
+- `name` (first command line argument): A user-friendly name for the device.
+- `threshold` (-t, default: 2) The threshold value to use.
+- `instance_id`: Instance ID to use in Base45 encoding. If not set, a random InstanceID will be generated.
+- `output_filename` (-o, default: "keyshare"): Filename prefix for saving the key share.
+- `mqtt_host`: (default: "localhost"): hostname to use for the MQTT broker.
+- `mqtt_port`: (default: 1883): port to use for the MQTT broker.
+- `qr_data`: (-q): QR Data from other party. If not set, the device will be the initiator.
+
+By necessity, the CLI is interactive. Usage example:
+
+1. Start an MQTT broker (e.g. Mosquitto).
+2. Start the first device (initiator): `./dkg Device0`
+    - You may optionally set the threshold, instance ID, output filename, mqtt
+      host and port, as above.
+    - When properly started, this will display "My QR" followed by the QR Code
+      data. Copy this data for the next command.
+3. Start another device: `./dkg Device1 -q <QR_DATA>`
+    - Note that the MQTT host and port must be configured to match the initial
+      device. In the future this may become part of the QR Data.
+4. Start any other devices in the same way, or copy QR data from one to the
+   other for additional verification.
+5. Once the desired devices are started, press enter in any one CLI to begin the
+   DKG process.
+
+### Common Signing Parameters & Usage
+
+- `keyshare_filename` (first command line parameter): the filename of the
+  keyshare data to load.
+- `mqtt_host`: (default: "localhost"): hostname to use for the MQTT broker.
+- `mqtt_port`: (default: 1883): port to use for the MQTT broker.
+
+By necessity the CLI is interactive. The CLI for all of the examples should be
+similar, but might have small discrepancies. Usage is generally:
+
+1. Start instances for the desired active key shares, e.g. `./sign
+   keyshare_deviceX`.
+2. On any interface, use the CLI to request a signature, e.g. `s Some Message`
+3. You should see the new request appear on the other devices. If you approve
+   the request on a threshold number of interfaces the signature will be
+   automatically generated.
+
+You can also reject requests and cancel requests from the originator to test
+these functionalities.
+
+### Rust
+
+Running the example code in Rust should be as easy as:
+
+```sh
+cd examples/rust
+cargo run --bin dkg Device0
+cargo run --bin sign keyshare_Device0
+```
 
 ### Swift
-Include the local package in your `Package.swift` or Xcode project. The package definition is located in the root directory.
+
+The example Swift CLI references the generated Swift package in the project root
+directly. As such, you must generate the Swift package first before you can run
+the example. From the project root:
+
+```sh
+./build-swift.sh
+cd examples/swift
+swift run dkg Device0
+swift run sign keyshare_Device0
+```
 
 ## Core Concepts
 
