@@ -3,3 +3,6 @@
 .idea/
 GEMINI.md
 keyshares/
+target/
+generated/
+DKLSLib/

@@ -185,7 +185,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
     }
 
     // Helper listener to capture events
-    class AsyncSignListener: SignRequestListener, SignResultListener {
+    final class AsyncSignListener: SignRequestListener, SignResultListener, @unchecked Sendable {
         var reqContinuation: AsyncStream<SignSetupMessage>.Continuation?
         var resContinuation: AsyncStream<Signature>.Continuation?
 
@@ -202,11 +202,11 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             self.resContinuation = resCont
         }
 
-        func receiveSignSetupMessage(req: SignSetupMessage, dev: DeviceInfo?) {
+        func receiveSignRequest(req: SignSetupMessage, dev: DeviceInfo?) {
             reqContinuation?.yield(req)
         }
 
-        func cancelSignSetupMessage(req: SignSetupMessage) {}
+        func cancelSignRequest(req: SignSetupMessage) {}
         func signDevicesChanged(req: SignSetupMessage, devices: [DeviceInfo?]) {}
         func signDsgStarted(req: SignSetupMessage) {}
         func signCancelled(req: SignSetupMessage) {}
@@ -245,7 +245,7 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
             }
 
             // Start request
-            try await node.requestSignString(message: message, listener: listener)
+            _ = try await node.requestSignString(message: message, listener: listener)
 
             // Wait for result
             let sig = await listener.nextResult()
@@ -296,28 +296,30 @@ final class TestSetupListener: DkgSetupChangeListener, @unchecked Sendable {
     }
 }
 
-final class NetworkMirror: NetworkInterface {
-    let semaphore = DispatchSemaphore(value: 0)
-    var buffer: Data
+final class NetworkMirror: NetworkInterface, @unchecked Sendable {
+    var buffer: Data?
+
     init() {
-        self.buffer = Data()
     }
 
     func send(data: Data) async throws {
         print("I sleep.")
-        await Task.sleep(100)
+        try await Task.sleep(nanoseconds: 100)
         print("Sending data: \(data)")
         buffer = data
-        semaphore.signal()
     }
 
     func receive() async throws -> Data {
-        let result = semaphore.wait(timeout: .now() + 0.001)
-        guard result == .success else {
-            throw GeneralError.MessageSendError
+        for _ in 0..<10 {
+            if let b = buffer {
+                let res = b
+                buffer = nil
+                print("Receiving data: \(res)")
+                return res
+            }
+            try await Task.sleep(nanoseconds: 100_000)
         }
-        print("Receiving data: \(buffer)")
-        return buffer
+        throw GeneralError.MessageSendError
     }
 }
 
@@ -348,14 +350,14 @@ final class MockNetworkInterface: NetworkInterface {
 
     func send(data: Data) async throws {
         if send_delay > 0 {
-            await Task.sleep(send_delay)
+            try await Task.sleep(nanoseconds: send_delay)
         }
         try send_result.get()
     }
 
     func receive() async throws -> Data {
         if received_delay > 0 {
-            await Task.sleep(received_delay)
+            try await Task.sleep(nanoseconds: received_delay)
         }
         return try receive_result.get()
     }
@@ -469,11 +471,10 @@ final class MockNetworkInterface: NetworkInterface {
     #expect(qr1.id == qr1.toBytes())
 
     // 4. DeviceLocalData
-    if let data = try? genLocalData(t: 2, n: 3) {
-        let node1Data = data[0]
-        let localDataBytes = try encoder.encode(node1Data)
-        let node1DataClone = try decoder.decode(DeviceLocalData.self, from: localDataBytes)
-        #expect(node1Data == node1DataClone)
-        #expect(node1Data.hashValue == node1DataClone.hashValue)
-    }
+    let data = genLocalData(t: 2, n: 3)
+    let node1Data = data[0]
+    let localDataBytes = try encoder.encode(node1Data)
+    let node1DataClone = try decoder.decode(DeviceLocalData.self, from: localDataBytes)
+    #expect(node1Data == node1DataClone)
+    #expect(node1Data.hashValue == node1DataClone.hashValue)
 }

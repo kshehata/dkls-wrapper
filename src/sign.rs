@@ -364,7 +364,7 @@ impl SignSetupMessage {
  * Support structs for SignNode.
  *****************************************************************************/
 
-use hex;
+// use hex;
 // Helper to do the actual signature for a given request using the context
 // and relay. Made general for testing.
 pub async fn do_sign_relay<R: Relay>(

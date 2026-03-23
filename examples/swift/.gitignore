@@ -7,5 +7,5 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 
-dkls-ffi.xcframework
+libdkls-rs.xcframework
 Sources/DKLSLib/dkls.swift
