@@ -1,6 +1,8 @@
 use clap::Parser;
-use dkls::sign::{SignNode, SignRequestListener, SignRequestType, SignSetupMessage};
-use dkls::types::DeviceLocalData;
+use mobile_tss::error::GeneralError;
+use mobile_tss::sign::{SignNode, SignRequestListener, SignRequestType, SignResultListener, SignSetupMessage};
+use mobile_tss::types::{DeviceInfo, DeviceLocalData, Signature};
+
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -40,7 +42,7 @@ impl SignRequestListener for ConsoleListener {
     fn receive_sign_request(
         &self,
         req: Arc<SignSetupMessage>,
-        dev: Option<Arc<dkls::types::DeviceInfo>>,
+        dev: Option<Arc<DeviceInfo>>,
     ) {
         println!("\n*** NEW SIGN REQUEST ***");
         let index = {
@@ -89,15 +91,12 @@ impl SignRequestListener for ConsoleListener {
     }
 }
 
-use dkls::error::GeneralError;
-use dkls::sign::SignResultListener;
-use dkls::types::Signature;
 
 impl SignResultListener for ConsoleListener {
     fn sign_devices_changed(
         &self,
         req: Arc<SignSetupMessage>,
-        devices: Vec<Option<Arc<dkls::types::DeviceInfo>>>,
+        devices: Vec<Option<Arc<DeviceInfo>>>,
     ) {
         println!("\n*** SIGNING DEVICES CHANGED ***");
         println!("Instance ID: {}", hex::encode(req.instance));
@@ -155,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("DKLS CLI Signing Tool");
+    println!("TSS CLI Signing Tool");
     println!("Loading keyshare from {}...", args.keyshare_filename);
 
     let local_data_bytes = tokio::fs::read(&args.keyshare_filename)

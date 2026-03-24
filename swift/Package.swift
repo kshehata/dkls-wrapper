@@ -1,33 +1,33 @@
 // swift-tools-version:5.5
 // The swift-tools-version declares the minimum version of Swift required to build this package.
-// Swift Package: DKLSLib
+// Swift Package: MobileTSS
 
 import PackageDescription;
 
 let package = Package(
-    name: "DKLSLib",
+    name: "MobileTSS",
     platforms: [
         .iOS(.v13),
         .macOS(.v10_15)
     ],
     products: [
         .library(
-            name: "DKLSLib",
-            targets: ["DKLSLib"]
+            name: "MobileTSS",
+            targets: ["MobileTSS"]
         )
     ],
     dependencies: [ ],
     targets: [
-        .binaryTarget(name: "dkls-ffi", path: "./dkls-ffi.xcframework"),
+        .binaryTarget(name: "mobile-tss-ffi", path: "./mobile-tss-ffi.xcframework"),
         .target(
-            name: "DKLSLib",
+            name: "MobileTSS",
             dependencies: [
-                .target(name: "dkls-ffi")
+                .target(name: "mobile-tss-ffi")
             ]
         ),
         .testTarget(
-            name: "DKLSLibTests",
-            dependencies: ["DKLSLib"]
+            name: "MobileTSSTests",
+            dependencies: ["MobileTSS"]
         ),
     ]
 )

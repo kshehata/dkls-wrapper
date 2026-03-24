@@ -440,29 +440,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dkls-wrapper"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "futures",
- "hex",
- "k256",
- "postcard",
- "rand",
- "rand_chacha",
- "rand_core",
- "serde",
- "serde_json",
- "signature",
- "sl-dkls23",
- "sl-mpc-mate",
- "thiserror 1.0.69",
- "tokio",
- "uniffi",
-]
-
-[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -861,6 +838,29 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "mobile-tss"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "hex",
+ "k256",
+ "postcard",
+ "rand",
+ "rand_chacha",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "signature",
+ "sl-dkls23",
+ "sl-mpc-mate",
+ "thiserror 1.0.69",
+ "tokio",
+ "uniffi",
+]
 
 [[package]]
 name = "nom"

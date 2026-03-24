@@ -1,9 +1,9 @@
-# DKLS Wrapper Library
+# Mobile TSS Wrappers
 
-This library provides a cross-platform wrapper for the
-[DKLS23](https://eprint.iacr.org/2023/765.pdf) threshold signature scheme,
-enabling distributed signature generation (DSG) for ECDSA in a $t$-of-$n$ setup.
-It currently relies on the [Silence Labs](https://silencelaboratories.com/)
+This library provides a cross-platform wrapper for threshold signature schemes
+(TSS), such as [DKLS23](https://eprint.iacr.org/2023/765.pdf), enabling
+distributed signature generation (DSG) for ECDSA in a $t$-of-$n$ setup. It
+currently relies on the [Silence Labs](https://silencelaboratories.com/)
 [DKLS23](https://github.com/silence-laboratories/dkls23) Rust Crate. The library
 is written in Rust and provides bindings via
 [UniFFI](https://github.com/mozilla/uniffi-rs) for Swift and Kotlin, as well as

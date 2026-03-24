@@ -595,58 +595,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dkls-cli-examples"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "base45",
- "clap",
- "dkls-wrapper",
- "env_logger",
- "futures",
- "hex",
- "k256",
- "postcard",
- "rand",
- "rand_chacha",
- "rand_core",
- "rumqttc",
- "serde",
- "serde_json",
- "signature",
- "sl-dkls23",
- "sl-mpc-mate",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "dkls-wrapper"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "futures",
- "hex",
- "k256",
- "postcard",
- "rand",
- "rand_chacha",
- "rand_core",
- "serde",
- "serde_json",
- "signature",
- "sl-dkls23",
- "sl-mpc-mate",
- "thiserror 1.0.69",
- "tokio",
- "uniffi",
-]
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1203,6 +1151,58 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mobile-tss"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "hex",
+ "k256",
+ "postcard",
+ "rand",
+ "rand_chacha",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "signature",
+ "sl-dkls23",
+ "sl-mpc-mate",
+ "thiserror 1.0.69",
+ "tokio",
+ "uniffi",
+]
+
+[[package]]
+name = "mobile-tss-mqtt-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "base45",
+ "clap",
+ "env_logger",
+ "futures",
+ "hex",
+ "k256",
+ "mobile-tss",
+ "postcard",
+ "rand",
+ "rand_chacha",
+ "rand_core",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "signature",
+ "sl-dkls23",
+ "sl-mpc-mate",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

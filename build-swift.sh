@@ -2,13 +2,13 @@
 
 set -e
 
-cargo swift package -n DKLSLib --xcframework-name dkls-ffi -p ios macos
+cargo swift package -n MobileTSS --xcframework-name mobile-tss-ffi -p ios macos
 
 shopt -s extglob
-cp -R swift/!(README*) DKLSLib/
+cp -R swift/!(README*) MobileTSS/
 
-sed -i '' 's/^open class /public final class /' DKLSLib/Sources/DKLSLib/dkls.swift
-sed -i '' 's/^open func /public func /' DKLSLib/Sources/DKLSLib/dkls.swift
+sed -i '' 's/^open class /public final class /' MobileTSS/Sources/MobileTSS/mobile_tss.swift
+sed -i '' 's/^open func /public func /' MobileTSS/Sources/MobileTSS/mobile_tss.swift
 
-cd DKLSLib
+cd MobileTSS
 swift test

@@ -2,8 +2,8 @@
  * Example MQTT interface.
  *****************************************************************************/
 
-use dkls::error::GeneralError;
-use dkls::net::NetworkInterface;
+use mobile_tss::error::GeneralError;
+use mobile_tss::net::NetworkInterface;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

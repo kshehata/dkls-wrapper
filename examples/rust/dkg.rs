@@ -1,7 +1,7 @@
 use clap::Parser;
-use dkls::dkg::{DKGNode, DKGSetupChangeListener, DKGState, DKGStateChangeListener, QRData};
-use dkls::net::NetworkInterface;
-use dkls::types::{DeviceInfo, InstanceId};
+use mobile_tss::dkg::{DKGNode, DKGSetupChangeListener, DKGState, DKGStateChangeListener, QRData};
+use mobile_tss::net::NetworkInterface;
+use mobile_tss::types::{DeviceInfo, InstanceId};
 
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let output_filename = format!("{}_{}", args.output_filename, args.name);
 
-    println!("DKLS CLI DKG Test (Rust)");
+    println!("TSS CLI DKG Test (Rust)");
     println!("Output filename: {}", output_filename);
     println!("MQTT host: {}", args.mqtt_host);
     println!("MQTT port: {}", args.mqtt_port);

@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import DKLSLib
+@testable import MobileTSS
 
 actor TestMemoryBridge {
     var listeners: [UUID: AsyncStream<Data>.Continuation] = [:]

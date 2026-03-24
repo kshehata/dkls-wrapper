@@ -1,12 +1,12 @@
 # DKG Wrapper
 
-The `dkls-wrapper` includes a wrapper for DKG setup that is intended for use in
-a mobile app. The problem is simple: DKG is secure if you're starting from a set
-of nodes with established public keys. But if you're starting from scratch how
-do you determine the initial set of public keys? In particular, if a user who
-*isn't* a cryptographer is setting up a new key, how can we guide them through
-the process in a way that is both secure (for some definition of security) and
-easy to use?
+The `mobile-tss` library includes a wrapper for DKG setup that is intended for
+use in a mobile app. The problem is simple: DKG is secure if you're starting
+from a set of nodes with established public keys. But if you're starting from
+scratch how do you determine the initial set of public keys? In particular, if a
+user who *isn't* a cryptographer is setting up a new key, how can we guide them
+through the process in a way that is both secure (for some definition of
+security) and easy to use?
 
 This document describes how this setup is intended to work to a cryptographic /
 security-minded audience.

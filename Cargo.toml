@@ -1,11 +1,11 @@
 [package]
-name = "dkls-wrapper"
+name = "mobile-tss"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
-name = "dkls"
+name = "mobile_tss"
 
 [dependencies]
 uniffi = { version = "0.30.0", features = [ "cli" ] }

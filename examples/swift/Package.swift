@@ -4,7 +4,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "DKLSExample",
+    name: "MobileTSSExample",
     platforms: [
         .macOS(.v10_15),
         .iOS(.v13),
@@ -33,13 +33,13 @@ let package = Package(
             url: "https://github.com/ehn-dcc-development/base45-swift.git",
             from: "1.1.0"
         ),
-        .package(path: "../../DKLSLib"),
+        .package(path: "../../MobileTSS"),
     ],
     targets: [
         .target(
             name: "CLICore",
             dependencies: [
-                .product(name: "DKLSLib", package: "DKLSLib"),
+                .product(name: "MobileTSS", package: "MobileTSS"),
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
             ]
         ),
@@ -47,7 +47,7 @@ let package = Package(
             name: "CLIKeyGen",
             dependencies: [
                 "CLICore",
-                .product(name: "DKLSLib", package: "DKLSLib"),
+                .product(name: "MobileTSS", package: "MobileTSS"),
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "base45-swift", package: "base45-swift"),
@@ -57,7 +57,7 @@ let package = Package(
             name: "CLISign",
             dependencies: [
                 "CLICore",
-                .product(name: "DKLSLib", package: "DKLSLib"),
+                .product(name: "MobileTSS", package: "MobileTSS"),
                 .product(name: "MQTTNIO", package: "mqtt-nio"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
